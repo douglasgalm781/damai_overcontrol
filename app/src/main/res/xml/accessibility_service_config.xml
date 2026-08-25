@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:notificationTimeout="500"
+    android:description="@string/a11y_service_desc" />
+<!--
+  No packageNames filter: we need a window-state-changed event from *any* app to notice
+  when Damai has left the foreground (see CountdownAccessibilityService), so the overlay
+  can clear itself. Text content is still only ever read when the event's own package is
+  cn.damai — everything else is filtered out in code before any node is inspected.
+
+  canPerformGestures is what lets NodeActions synthesize a tap at a node's coordinates.
+  It's needed because Damai's buttons are frequently custom-drawn and expose no clickable
+  node to press via ACTION_CLICK. Taps are only ever sent when the user asks for one
+  (long-press on the overlay pill) — nothing here taps on its own.
+-->
+

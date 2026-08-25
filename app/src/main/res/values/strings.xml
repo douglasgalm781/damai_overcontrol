@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">大麦倒计时 Overcontrol</string>
+    <string name="a11y_service_desc">读取大麦(cn.damai)界面上已显示的开抢/开票时间文字，用来在悬浮窗里显示倒计时；离开大麦时倒计时会清空。为了能识别"已离开大麦"，会看到切换到了哪个应用，但只读取其名称，从不读取其界面内容。\n\n另外会代替你点击购票按钮：当悬浮窗显示🟢（当前页面就是所跟踪演出的页面）并持续 5 秒后，会自动点击该页面上的"预约抢票"；长按悬浮窗也可立即点击购票按钮。不会输入文字。\n\nReads the on-sale time text already shown on Damai\'s (cn.damai) screen, to power a floating countdown, which clears when you leave Damai. To detect that you\'ve left, it sees which app you switch to, but only its name — it never reads that app\'s on-screen content.\n\nIt also taps for you: once the pill shows 🟢 (the page on screen is the tracked show\'s own page) for 5 seconds straight, it presses 预约抢票 on that page. Long-pressing the pill presses the buy button immediately. It never types.</string>
+</resources>
