@@ -5,13 +5,14 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * The one concert being tracked: the one Damai shows as 已预约 (already reserved), found by
- * {@link CountdownAccessibilityService} and displayed by {@link OverlayService}.
+ * The one concert being tracked: whichever concert page the user is looking at that has a
+ * future on-sale time, found by {@link CountdownAccessibilityService} and displayed by
+ * {@link OverlayService}.
  *
  * <p>Earlier this held every on-sale time seen this session and displayed whichever was
- * soonest. That guessed at intent — the soonest show on screen is rarely the one you care
- * about. A 已预约 badge is the user saying which concert matters, so exactly one show is
- * tracked and everything else on screen is ignored.
+ * soonest. That guessed at intent — the soonest show anywhere is rarely the one you care
+ * about — so exactly one show is tracked: the one on screen, with a reserved one
+ * outranking it so that browsing elsewhere can't steal tracking from it.
  *
  * <p>Deliberately survives leaving Damai (unlike the old behaviour, which dropped
  * everything the moment Damai lost focus): the countdown has to keep running while the
@@ -25,12 +26,14 @@ final class CountdownState {
         final long target;          // on-sale (开抢) time, epoch millis
         final String title;         // nullable — no title could be scraped
         final List<String> details; // date / venue / price lines for the expanded pill
+        final boolean reserved;     // Damai showed this concert as 已预约 — turns the pill green
         final long lastSeen;
 
-        Show(long target, String title, List<String> details, long lastSeen) {
+        Show(long target, String title, List<String> details, boolean reserved, long lastSeen) {
             this.target = target;
             this.title = title;
             this.details = Collections.unmodifiableList(new ArrayList<>(details));
+            this.reserved = reserved;
             this.lastSeen = lastSeen;
         }
     }
@@ -38,7 +41,7 @@ final class CountdownState {
     /** Drop a reservation not re-seen in this long, so a cancelled one can't linger. */
     private static final long TTL_MS = 24L * 3600_000L;
 
-    private static volatile Show reserved;
+    private static volatile Show reservedShow;
     // Whether the screen scanned most recently was this concert's own page. Not what
     // drives the pill's colour — it gates the click, which can only work on that page.
     private static volatile boolean onItsPage = false;
@@ -47,42 +50,51 @@ final class CountdownState {
     private CountdownState() {}
 
     /**
-     * Record the 已预约 concert seen on screen just now. Title and details are merged
-     * rather than overwritten: a page may show the reservation and the on-sale time
-     * without repeating the venue or price, and dropping them would make the expanded
-     * pill flicker between full and empty.
+     * Record the concert on screen just now, reserved or not. An unreserved one still
+     * counts down — that is the whole point before you have reserved it — it simply
+     * doesn't turn the pill green.
+     *
+     * <p>A reserved concert outranks an unreserved one: browsing another show must not
+     * steal tracking from the one actually reserved. Title and details are merged rather
+     * than overwritten, since a page may show the countdown without repeating the venue,
+     * and dropping them would make the panel flicker between full and empty.
      */
-    static void observeReserved(long target, String title, List<String> details, long now) {
-        Show existing = reserved;
+    static void observe(long target, String title, List<String> details, boolean reserved, long now) {
+        Show existing = reservedShow;
         boolean sameShow = existing != null && existing.target == target;
+        if (existing != null && existing.reserved && !reserved && !sameShow) return;
 
         String keptTitle = title != null ? title : (sameShow ? existing.title : null);
         List<String> keptDetails = !details.isEmpty()
                 ? details
-                : (sameShow ? existing.details : Collections.emptyList());
+                : (sameShow ? existing.details : Collections.<String>emptyList());
+        // Once seen as reserved, stay reserved for this show: the marker is only drawn on
+        // some parts of the page, so scrolling away from it is not a cancellation.
+        boolean keptReserved = reserved || (sameShow && existing.reserved);
 
-        reserved = new Show(target, keptTitle, keptDetails, now);
+        reservedShow = new Show(target, keptTitle, keptDetails, keptReserved, now);
     }
 
     /** The tracked concert, or null if none is being tracked (or it aged out). */
     static Show reserved(long now) {
-        Show show = reserved;
+        Show show = reservedShow;
         if (show == null) return null;
         if (now - show.lastSeen > TTL_MS) {
-            reserved = null;
+            reservedShow = null;
             return null;
         }
         return show;
     }
 
-    /** True once a 已预约 concert is being tracked — this is what turns the pill green. */
-    static boolean isTracking(long now) {
-        return reserved(now) != null;
+    /** True when the tracked concert is reserved — this is what turns the pill green. */
+    static boolean isReserved(long now) {
+        Show show = reserved(now);
+        return show != null && show.reserved;
     }
 
     /** Forget the tracked concert entirely. */
     static void clear() {
-        reserved = null;
+        reservedShow = null;
         onItsPage = false;
         damaiForeground = false;
     }

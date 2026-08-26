@@ -182,26 +182,20 @@ public class CountdownAccessibilityService extends AccessibilityService {
         }
 
         if (!reservedHere) {
-            // Record what this page *did* expose. If a concert is reserved and the pill
-            // still says "waiting", this is the evidence needed to find the right marker:
-            // the bottom action button contributes no node at all on the detail page, so
-            // 已预约 may simply never reach us. Shown in MainActivity.
+            // Record what this page exposed, so a reserved concert that never turns the
+            // pill green can be diagnosed in MainActivity: the bottom action button puts
+            // no node in the tree at all, so 已预约 may simply never reach us.
             ScreenLog.record(this, now, describeScreen(texts, onSaleAt));
-            // Not the reserved concert's page. Leave whatever is already tracked alone —
-            // it is still counting down — but nothing here can be clicked.
-            CountdownState.setOnItsPage(false);
-            return;
         }
 
-        CountdownState.Show tracked = CountdownState.reserved(now);
         if (onSaleAt == null) {
-            // Reserved, but this screen doesn't spell out the on-sale time (a list row, or
-            // the detail page after the countdown block has scrolled away). Keep tracking.
-            CountdownState.setOnItsPage(tracked != null);
+            // No on-sale time on this screen — a list row, or the detail page scrolled
+            // past its countdown block. Keep whatever is already tracked.
+            CountdownState.setOnItsPage(CountdownState.reserved(now) != null && reservedHere);
             return;
         }
 
-        CountdownState.observeReserved(onSaleAt, pickTitle(texts), pickDetails(texts), now);
+        CountdownState.observe(onSaleAt, pickTitle(texts), pickDetails(texts), reservedHere, now);
         CountdownState.setOnItsPage(true);
     }
 

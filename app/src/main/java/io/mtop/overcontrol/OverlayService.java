@@ -21,6 +21,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -120,11 +121,18 @@ public class OverlayService extends Service {
     private static volatile boolean running = false;
 
     private WindowManager wm;
-    private TextView pill;
+    private LinearLayout container; // the whole overlay: pill + panel, what the window holds
+    private TextView pill;          // the countdown line; owns drag + tap
+    private LinearLayout panel;     // details and controls, shown by tapping the pill
+    private TextView detailText;
+    private TextView armButton;
     private WindowManager.LayoutParams lp;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final float[] drag = new float[4]; // touchStartX, touchStartY, pillStartX, pillStartY
-    private boolean expanded = false; // tapped open to show the show's scraped title
+    private boolean expanded = false; // tapped open to show details and the controls
+    // Whether the T-0 press is allowed to fire. The Start/Pause control in the panel is
+    // the user's hand on this: armed by default, because booking at T-0 is the point.
+    private boolean armed = true;
     private boolean longPressFired = false; // so the following ACTION_UP isn't also a tap
     private final Runnable longPress = this::performTargetClick;
 
@@ -133,8 +141,9 @@ public class OverlayService extends Service {
     private long bookedTarget = 0L;      // on-sale time we have already pressed for
     private long lastBookAttemptAt = 0L;
     private boolean dumpedThisTarget = false;
-    private int lastPillHeight = -1;
-    private int lastPillWidth = -1;
+    private int collapsedY = -1; // where the pill sat before the panel opened
+    private int lastLaidOutHeight = -1;
+    private int lastLaidOutWidth = -1;
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -193,19 +202,50 @@ public class OverlayService extends Service {
         if (!Settings.canDrawOverlays(this)) return; // permission not granted yet; nothing to draw
 
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
         pill = new TextView(this);
         pill.setTextColor(Color.WHITE);
         pill.setTextSize(14f);
         pill.setPadding(dp(16), dp(10), dp(16), dp(10));
         pill.setGravity(Gravity.CENTER);
         pill.setLineSpacing(dp(2), 1f);
-        pill.setMaxWidth(dp(260)); // long titles wrap instead of stretching the pill off-screen
+        pill.setMaxWidth(dp(260)); // long titles wrap instead of stretching the overlay
+        pill.setText("⚪ 等待数据 Waiting…");
+
+        detailText = new TextView(this);
+        detailText.setTextColor(0xFFD7E3E1);
+        detailText.setTextSize(12f);
+        detailText.setGravity(Gravity.CENTER);
+        detailText.setLineSpacing(dp(2), 1f);
+        detailText.setMaxWidth(dp(260));
+        detailText.setPadding(dp(14), 0, dp(14), dp(8));
+
+        armButton = controlButton("", v -> {
+            armed = !armed;
+            render();
+        });
+
+        panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+        panel.setVisibility(View.GONE); // opened by tapping the pill
+        panel.addView(divider());
+        panel.addView(detailText);
+        panel.addView(armButton);
+
+        container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setGravity(Gravity.CENTER_HORIZONTAL);
+        // Long titles wrap instead of stretching the overlay off-screen.
+        container.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0x9A0B0E14);
         bg.setCornerRadius(dp(18));
         bg.setStroke(dp(1), 0xFF3DD6C0);
-        pill.setBackground(bg);
-        pill.setText("⚪ 等待数据 Waiting…");
+        container.setBackground(bg);
+        container.addView(pill);
+        container.addView(panel);
 
         int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -242,8 +282,7 @@ public class OverlayService extends Service {
                 case MotionEvent.ACTION_UP:
                     handler.removeCallbacks(longPress);
                     if (!longPressFired && !movedBeyondSlop(ev)) {
-                        expanded = !expanded;
-                        render();
+                        setExpanded(!expanded);
                     }
                     return true;
                 case MotionEvent.ACTION_CANCEL:
@@ -254,36 +293,69 @@ public class OverlayService extends Service {
             }
         });
 
+        // React to real layout passes rather than measuring the tree by hand: calling
+        // measure() outside a layout pass clears the pending request from setText, and a
+        // newly-shown child then never gets measured at all.
+        container.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or_, ob) -> {
+            int h = b - t, w = r - l;
+            if (h == lastLaidOutHeight && w == lastLaidOutWidth) return;
+            lastLaidOutHeight = h;
+            lastLaidOutWidth = w;
+            container.post(() -> {
+                clampToScreen();
+                applyLayout();
+            });
+        });
+
         try {
-            wm.addView(pill, lp);
+            wm.addView(container, lp);
         } catch (Exception ignored) {}
         // WRAP_CONTENT means the height isn't known until the first layout pass.
-        pill.post(this::restAtBottom);
+        container.post(this::restAtBottom);
     }
 
     /** Parks the pill near the bottom-left, above Damai's action bar. */
     private void restAtBottom() {
-        if (pill == null || lp == null) return;
+        if (container == null || lp == null) return;
         DisplayMetrics dm = getResources().getDisplayMetrics();
         lp.x = dp(EDGE_MARGIN_DP);
-        lp.y = dm.heightPixels - pill.getHeight() - dp(BOTTOM_MARGIN_DP);
+        lp.y = dm.heightPixels - container.getHeight() - dp(BOTTOM_MARGIN_DP);
         clampToScreen();
         applyLayout();
     }
 
+    /**
+     * Opens or closes the panel, making room for it before it is laid out and handing the
+     * old spot back when it closes, so the overlay doesn't creep up the screen.
+     */
+    private void setExpanded(boolean open) {
+        if (container == null || lp == null) return;
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        if (open && !expanded) {
+            collapsedY = lp.y;
+            lp.y = Math.min(lp.y, Math.max(0, dm.heightPixels - dp(PANEL_RESERVE_DP)));
+        } else if (!open && expanded && collapsedY >= 0) {
+            lp.y = collapsedY;
+            collapsedY = -1;
+        }
+        expanded = open;
+        applyLayout();
+        render();
+    }
+
     /** Keeps the pill fully on screen, so it can't be dragged out of reach. */
     private void clampToScreen() {
-        if (pill == null || lp == null) return;
+        if (container == null || lp == null) return;
         DisplayMetrics dm = getResources().getDisplayMetrics();
-        int maxX = Math.max(0, dm.widthPixels - pill.getWidth());
-        int maxY = Math.max(0, dm.heightPixels - pill.getHeight());
+        int maxX = Math.max(0, dm.widthPixels - container.getWidth());
+        int maxY = Math.max(0, dm.heightPixels - container.getHeight());
         lp.x = Math.min(Math.max(0, lp.x), maxX);
         lp.y = Math.min(Math.max(0, lp.y), maxY);
     }
 
     private void applyLayout() {
         try {
-            wm.updateViewLayout(pill, lp);
+            wm.updateViewLayout(container, lp);
         } catch (Exception ignored) {}
     }
 
@@ -293,7 +365,7 @@ public class OverlayService extends Service {
      * the pill out of hit-testing before the gesture is dispatched.
      */
     private void clickWithPillHidden(Runnable click) {
-        if (pill != null) pill.setVisibility(View.GONE);
+        if (container != null) container.setVisibility(View.GONE);
         handler.removeCallbacks(showPill);
         handler.postDelayed(() -> {
             try {
@@ -307,22 +379,27 @@ public class OverlayService extends Service {
     }
 
     private final Runnable showPill = () -> {
-        if (pill != null) pill.setVisibility(View.VISIBLE);
+        if (container != null) container.setVisibility(View.VISIBLE);
     };
 
     /**
      * Presses {@value #BOOK_NOW_TARGET} once the tracked concert's on-sale time has
      * arrived. Called once a second from the ticker.
      *
-     * <p>Unlike the dwell this replaces, there is nothing to wait for: T-0 is the moment,
-     * and being a second late costs a ticket. So it fires on the first tick at or after
-     * the target and then retries every {@link #BOOK_RETRY_MS} for {@link
-     * #BOOK_WINDOW_MS}, because Damai does not always relabel the button the instant the
-     * clock runs out. One success per concert; a different reservation starts over.
+     * <p>There is nothing to wait for beyond the clock: T-0 is the moment, and being a
+     * second late costs a ticket. It fires on the first tick at or after the target and
+     * then retries every {@link #BOOK_RETRY_MS} for {@link #BOOK_WINDOW_MS} — that retry
+     * loop is what "press it once the button appears" means in practice, since Damai does
+     * not always relabel the button the instant the clock runs out and the press simply
+     * misses until it does. One success per concert; a different reservation starts over.
+     *
+     * <p>Skipped entirely while paused, so the Start/Pause control in the panel is a real
+     * off switch and not just a label.
      */
     private void maybeBookNow(long now) {
         CountdownState.Show show = CountdownState.reserved(now);
         if (show == null) return;
+        if (!armed) return; // paused from the panel
 
         if (show.target != bookedTarget) dumpedThisTarget = false; // new concert, new slate
         if (now < show.target) return;                             // not yet
@@ -365,11 +442,11 @@ public class OverlayService extends Service {
     /** Plays the burst around the pill, once it is back on screen after the tap. */
     private void showClickEffect() {
         handler.postDelayed(() -> {
-            if (pill == null || wm == null) return;
+            if (container == null || wm == null) return;
             int[] loc = new int[2];
-            pill.getLocationOnScreen(loc);
+            container.getLocationOnScreen(loc);
             ClickEffectView.burst(this, wm,
-                    loc[0] + pill.getWidth() / 2, loc[1] + pill.getHeight() / 2);
+                    loc[0] + container.getWidth() / 2, loc[1] + container.getHeight() / 2);
         }, TAP_HIDE_TOTAL_MS - TAP_HIDE_LEAD_MS);
     }
 
@@ -411,12 +488,24 @@ public class OverlayService extends Service {
     }
 
     private void removeOverlay() {
-        if (wm != null && pill != null) {
+        if (wm != null && container != null) {
             try {
-                wm.removeView(pill);
+                wm.removeView(container);
             } catch (Exception ignored) {}
         }
     }
+
+    /**
+     * Room to reserve above the bottom edge before the panel opens.
+     *
+     * <p>The window is WRAP_CONTENT and rests near the bottom, so a panel opening in place
+     * asks for more height than is left below it and LinearLayout squeezes its last child
+     * — the Start/Pause button — down to nothing. Moving the window up *first* means the
+     * panel is laid out with room to begin with.
+     */
+    private static final int PANEL_RESERVE_DP = 420;
+    /** Width of the panel's controls; keeps the overlay as narrow as the pill's text. */
+    private static final int CONTROL_WIDTH_DP = 236;
 
     private void render() {
         render(System.currentTimeMillis());
@@ -428,30 +517,35 @@ public class OverlayService extends Service {
 
         String text;
         if (show == null) {
-            // Nothing reserved has been seen yet. Opening the reserved concert's page in
-            // Damai is what starts the tracking.
-            text = "⚪ 等待已预约演出\nWaiting for a reserved show";
+            text = "⚪ 等待演出信息\nWaiting for a show";
         } else {
+            // 🟢 only once Damai has shown this concert as reserved; an unreserved one
+            // still counts down, it just isn't green yet.
+            String dot = show.reserved ? "🟢" : "⚪";
             long remaining = show.target - now;
-            // 🟢 means: locked onto the concert you reserved. It stays green while the
-            // user is off in another app, because the countdown does too.
-            String head = remaining > 0 ? "🟢 开票倒计时 Starts in\n" + fmt(remaining) : onSaleLine(now, show);
-            text = expanded ? head + "\n" + describe(show) : head;
+            if (remaining > 0) {
+                text = dot + (armed ? "" : " ⏸") + " 开票倒计时 Starts in\n" + fmt(remaining);
+            } else {
+                // Past the on-sale time there is no countdown left to show — only what
+                // the booking press is doing.
+                text = dot + " " + onSaleLine(now, show);
+            }
         }
         pill.setText(text);
-        // Expanding to show the title makes the pill taller, and it grows downward from
-        // lp.y — parked near the bottom that would run it off the screen. Re-clamp, but
-        // only when the size actually changed, so the once-a-second tick doesn't churn
-        // through a window relayout every time the digits change.
-        pill.post(() -> {
-            if (pill == null) return;
-            int h = pill.getHeight(), w = pill.getWidth();
-            if (h == lastPillHeight && w == lastPillWidth) return;
-            lastPillHeight = h;
-            lastPillWidth = w;
-            clampToScreen();
-            applyLayout();
-        });
+
+        renderPanel(show);
+    }
+
+
+    /** The tap-open panel: what this concert is, and the control over the T-0 press. */
+    private void renderPanel(CountdownState.Show show) {
+        if (panel == null) return;
+        panel.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        if (!expanded) return;
+
+        detailText.setText(show == null ? "尚未识别演出 No show identified yet" : describe(show));
+        armButton.setText(armed ? "⏸  暂停自动抢票 Pause" : "▶  开始自动抢票 Start");
+        armButton.setBackground(pillShape(armed ? 0x33FFFFFF : 0xFF0B6B6B));
     }
 
     /** What the pill says from T-0 onward: pressing, pressed, or the window has closed. */
@@ -464,7 +558,7 @@ public class OverlayService extends Service {
     /** The expanded pill: which concert this is, and everything scraped about it. */
     private static String describe(CountdownState.Show show) {
         StringBuilder sb = new StringBuilder();
-        sb.append("— — —\n");
+        sb.append(show.reserved ? "已预约 Reserved\n" : "未预约 Not reserved yet\n");
         sb.append(show.title != null ? show.title : "演出名称暂缺 No title captured");
         for (String detail : show.details) sb.append('\n').append(detail);
         return sb.toString();
@@ -486,6 +580,45 @@ public class OverlayService extends Service {
 
     private static String pad(long n) {
         return n < 10 ? "0" + n : String.valueOf(n);
+    }
+
+    /** A compact control for the panel, styled to match the pill rather than the system. */
+    private TextView controlButton(String label, View.OnClickListener onClick) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(13f);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(18), dp(9), dp(18), dp(9));
+        b.setClickable(true);
+        b.setOnClickListener(onClick);
+        // A fixed width, deliberately: WRAP_CONTENT here measures to zero height inside
+        // this WRAP_CONTENT window (the button simply never appears), and MATCH_PARENT
+        // resolves against the whole screen and stretches the overlay across it.
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                dp(CONTROL_WIDTH_DP), LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(12);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private GradientDrawable pillShape(int color) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(999));
+        return d;
+    }
+
+    private View divider() {
+        View v = new View(this);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, dp(1) / 2));
+        lp.leftMargin = dp(14);
+        lp.rightMargin = dp(14);
+        lp.bottomMargin = dp(8);
+        v.setLayoutParams(lp);
+        v.setBackgroundColor(0x553DD6C0);
+        return v;
     }
 
     private int dp(int v) {

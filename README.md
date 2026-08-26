@@ -120,6 +120,41 @@ under a config without `canPerformGestures`, taps are silently dropped by the sy
 until accessibility access is toggled off and back on — the check turns that into a clear
 message instead of a mystery no-op.
 
+### The pill's states
+
+| Bottom button | Remaining | Pill |
+|---|---|---|
+| `预约抢票` (not reserved) | > 0 | ⚪ + countdown |
+| `已预约` (reserved) | > 0 | 🟢 + countdown |
+| either | ≤ 0, or no time found | status only, no countdown |
+
+Green means *reserved*, not *tracked*: an unreserved concert still counts down, because
+that countdown is the whole point before you have reserved it. A reserved concert outranks
+an unreserved one in `CountdownState`, so browsing another show can't steal tracking from
+the one you actually reserved.
+
+Tapping the pill opens a panel with the concert's details and a **Start/Pause** control
+over the T-0 press; tapping again closes it. Paused shows as `⏸` on the collapsed pill too,
+so a disarmed run is never a silent surprise. The press itself stays armed by default and,
+once the countdown reaches zero, retries every 1.5s for two minutes — which is what "press
+立即预订 once it appears" amounts to, given Damai relabels the button on its own schedule.
+
+### A WRAP_CONTENT child in a WRAP_CONTENT window measures to nothing
+
+The Start/Pause button did not appear at all for three builds. It was in the hierarchy,
+visible, with text set — and laid out at height 0, `getLineCount()` returning 0, meaning it
+never got a layout pass. Two separate causes, both worth knowing:
+
+- `LayoutParams.WRAP_CONTENT` **width** on a child of the WRAP_CONTENT panel inside the
+  WRAP_CONTENT overlay window measures to zero height. `MATCH_PARENT` renders but resolves
+  against the whole screen and stretches the overlay across it, so the controls use a fixed
+  `CONTROL_WIDTH_DP` instead.
+- Calling `container.measure(...)` by hand to work out where to reposition the window
+  cleared the pending layout request that `setText` had just posted, so the newly-shown
+  child was never measured. Never measure the live tree outside a layout pass: react to
+  `OnLayoutChangeListener` instead, and make room *before* opening the panel
+  (`PANEL_RESERVE_DP`) rather than measuring to find out how much is needed.
+
 ### The reserved marker may never reach us — hence `ScreenLog`
 
 The bottom action button contributes **no node at all**, whether it reads 预约抢票 or
