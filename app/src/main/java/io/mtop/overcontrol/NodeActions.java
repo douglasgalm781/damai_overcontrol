@@ -62,7 +62,8 @@ final class NodeActions {
                     Log.i(TAG, "clickByText: matched \"" + candidate + "\"");
                     return clickNode(svc, hit);
                 } finally {
-                    hit.recycle();
+                    // `finally` below recycles root; recycling it twice throws on API 30-.
+                    if (hit != root) hit.recycle();
                 }
             }
             Log.i(TAG, "clickByText: no match on screen");
@@ -92,7 +93,7 @@ final class NodeActions {
             try {
                 return clickNode(svc, hit);
             } finally {
-                hit.recycle();
+                if (hit != root) hit.recycle(); // root is recycled by the finally below
             }
         } finally {
             root.recycle();

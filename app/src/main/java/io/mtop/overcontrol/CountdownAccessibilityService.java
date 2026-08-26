@@ -3,6 +3,7 @@ package io.mtop.overcontrol;
 import android.accessibilityservice.AccessibilityService;
 import android.content.Intent;
 import android.os.Build;
+import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
@@ -50,6 +51,7 @@ public class CountdownAccessibilityService extends AccessibilityService {
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+        CrashLog.install(this);
         instance = this;
         Intent intent = new Intent(this, OverlayService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -82,7 +84,16 @@ public class CountdownAccessibilityService extends AccessibilityService {
         long now = System.currentTimeMillis();
         if (now - lastScanAt < MIN_SCAN_INTERVAL_MS) return;
         lastScanAt = now;
-        scan(now);
+        // The scan walks another app's node tree, whose shape and lifetime are not ours to
+        // control — a node can be recycled out from under us mid-walk. On API 30 and below
+        // that surfaces as IllegalStateException from the node pool, and letting it out of
+        // this callback kills the whole process (taking the overlay with it) on every
+        // content change. Drop the scan instead; the next event will try again.
+        try {
+            scan(now);
+        } catch (Throwable t) {
+            Log.e(NodeActions.TAG, "scan failed", t);
+        }
     }
 
     private void scan(long now) {
@@ -152,8 +163,15 @@ public class CountdownAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo cursor = dateNode;
         for (int hop = 0; hop < LABEL_SEARCH_ANCESTOR_HOPS; hop++) {
             AccessibilityNodeInfo parent = cursor.getParent();
-            if (cursor != dateNode) cursor.recycle();
+            // Only let go of the current node once there is a valid parent to move to.
+            // Recycling before this check left `cursor` pointing at a recycled node
+            // whenever the climb reached the window root early (getParent() == null), and
+            // it was then both read by findBestLabel and recycled a second time below. On
+            // API 31+ recycle() is a no-op so that was invisible; on API 28 the pool is
+            // real and both the use and the double-recycle throw IllegalStateException —
+            // once per scan, i.e. on every window content change.
             if (parent == null) break;
+            if (cursor != dateNode) cursor.recycle();
             cursor = parent;
         }
         if (cursor == dateNode) return null; // couldn't climb at all

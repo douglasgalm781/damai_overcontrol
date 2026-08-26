@@ -127,6 +127,7 @@ public class OverlayService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        CrashLog.install(this);
         startForeground(NOTIF_ID, buildNotification());
         addOverlay();
         handler.post(ticker);

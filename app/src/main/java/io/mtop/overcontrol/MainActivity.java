@@ -29,6 +29,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        CrashLog.install(this);
 
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -69,8 +70,16 @@ public class MainActivity extends Activity {
         refreshBtn.setText("刷新状态 Refresh status");
         refreshBtn.setOnClickListener(v -> refresh());
 
+        Button clearCrashBtn = new Button(this);
+        clearCrashBtn.setText("清除崩溃记录 Clear crash report");
+        clearCrashBtn.setOnClickListener(v -> {
+            CrashLog.clear(this);
+            refresh();
+        });
+
         status = new TextView(this);
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        status.setTextIsSelectable(true); // so a trace can be copied out, not just read
         status.setPadding(0, dp(16), 0, 0);
         status.setGravity(Gravity.START);
 
@@ -82,6 +91,7 @@ public class MainActivity extends Activity {
         root.addView(a11yBtn);
         root.addView(overlayBtn);
         root.addView(refreshBtn);
+        root.addView(clearCrashBtn);
         root.addView(sv);
         setContentView(root);
     }
@@ -107,6 +117,12 @@ public class MainActivity extends Activity {
                     + "5s of 🟢 auto-presses 预约抢票; long-press presses the buy button now.");
         } else {
             sb.append("\n请先完成以上两步授权。\nGrant both permissions above first.");
+        }
+        // Surfaced here because the phone that shows "Overcontrol keeps stopping" usually
+        // isn't the one with adb attached, and logcat is long gone by the time anyone looks.
+        String crash = CrashLog.read(this);
+        if (crash != null) {
+            sb.append("\n\n⚠ 上次崩溃 Last crash:\n").append(crash);
         }
         status.setText(sb.toString());
     }

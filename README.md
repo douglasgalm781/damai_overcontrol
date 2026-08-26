@@ -57,6 +57,28 @@ node cached from an earlier scan — those are recycled and their bounds go stal
 2. Failing that, a synthesized tap at the node's on-screen centre via `dispatchGesture` —
    this is what `android:canPerformGestures="true"` in the service config is for.
 
+### Node recycling differs by API level — test on an old device
+
+`AccessibilityNodeInfo.recycle()` returns the node to a real pool on API 30 and below:
+touching a recycled node, or recycling one twice, throws `IllegalStateException`. On
+API 31+ pooling was removed and `recycle()` is a no-op, so **both mistakes are completely
+silent on a modern phone and fatal on an old one**. Three such bugs lived here and only
+ever showed up on an API 28 Galaxy Note 8, as a repeating "Overcontrol keeps stopping":
+
+- `extractLabel` recycled `cursor` *before* checking whether `getParent()` returned null,
+  then read and re-recycled it when the climb hit the window root early. This ran on every
+  window content change, so on any page where the on-sale text sits within four levels of
+  the root it crashed continuously.
+- `clickByText` / `clickByViewId` recycled the matched node and then recycled `root` in a
+  `finally` — a double recycle whenever the match *was* the root.
+
+The rule these now follow: never release a node until a valid replacement is in hand, and
+never recycle a node an enclosing scope already owns. `onAccessibilityEvent` also wraps the
+whole scan in a catch-all, because the tree belongs to another app and can be recycled out
+from under a walk; an exception escaping that callback kills the process and takes the
+overlay with it. `MainActivity` shows the last crash (recorded by `CrashLog`) so a trace
+can be read off the phone when adb isn't attached.
+
 ### Gesture taps and old Android
 
 `tapAt` drags one pixel instead of emitting a move-only path. Android 9 (API 28) and
