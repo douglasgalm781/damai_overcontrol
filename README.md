@@ -129,14 +129,24 @@ message instead of a mystery no-op.
 | either | ≤ 0, or no time found | status only, no countdown |
 
 Green means *reserved*, not *tracked*: an unreserved concert still counts down, because
-that countdown is the whole point before you have reserved it. A reserved concert outranks
-an unreserved one in `CountdownState`, so browsing another show can't steal tracking from
-the one you actually reserved.
+that countdown is the whole point before you have reserved it.
+
+The pill follows the screen. Opening another concert switches to it, leaving Damai clears
+it outright, and a page that stops naming the tracked concert lets it go stale within
+`STALE_MS` (5s) — so the pill never advertises a show you have moved on from. Scrolling
+past the countdown block does *not* drop it: while the concert's title is still on screen
+the entry is `touch()`ed, which is what stops the pill blanking mid-scroll. An earlier
+version kept the show for 24h so the countdown survived switching apps; that traded a
+stale, wrong pill for a convenience nobody asked for.
 
 Tapping the pill opens a panel with the concert's details and a **Start/Pause** control
 over the T-0 press; tapping again closes it. Paused shows as `⏸` on the collapsed pill too,
-so a disarmed run is never a silent surprise. The press itself stays armed by default and,
-once the countdown reaches zero, retries every 1.5s for two minutes — which is what "press
+so a disarmed run is never a silent surprise. Pausing genuinely stops the press —
+`maybeBookNow` returns immediately while disarmed — and the retry window is measured from
+the later of T-0 and the moment it was armed, so pausing across the on-sale time and
+pressing Start afterwards still gets a full window rather than finding it already spent.
+The press stays armed by default and, once the countdown reaches zero, retries every 1.5s
+for two minutes — which is what "press
 立即预订 once it appears" amounts to, given Damai relabels the button on its own schedule.
 
 ### A WRAP_CONTENT child in a WRAP_CONTENT window measures to nothing

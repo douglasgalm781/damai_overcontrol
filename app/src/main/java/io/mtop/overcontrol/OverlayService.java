@@ -133,6 +133,9 @@ public class OverlayService extends Service {
     // Whether the T-0 press is allowed to fire. The Start/Pause control in the panel is
     // the user's hand on this: armed by default, because booking at T-0 is the point.
     private boolean armed = true;
+    // When arming last happened, so pausing doesn't quietly burn the booking window: a run
+    // resumed after T-0 gets its full retry window from the moment it was resumed.
+    private long armedSince = 0L;
     private boolean longPressFired = false; // so the following ACTION_UP isn't also a tap
     private final Runnable longPress = this::performTargetClick;
 
@@ -222,6 +225,7 @@ public class OverlayService extends Service {
 
         armButton = controlButton("", v -> {
             armed = !armed;
+            if (armed) armedSince = System.currentTimeMillis();
             render();
         });
 
@@ -399,12 +403,14 @@ public class OverlayService extends Service {
     private void maybeBookNow(long now) {
         CountdownState.Show show = CountdownState.reserved(now);
         if (show == null) return;
-        if (!armed) return; // paused from the panel
+        if (!armed) return; // paused from the panel — no press while stopped
 
         if (show.target != bookedTarget) dumpedThisTarget = false; // new concert, new slate
         if (now < show.target) return;                             // not yet
         if (bookedTarget == show.target) return;                   // already pressed
-        if (now - show.target > BOOK_WINDOW_MS) return;             // window closed
+        // Measured from the later of T-0 and the moment this was armed, so pausing over the
+        // on-sale time and pressing Start afterwards still gets a full window to work in.
+        if (now - Math.max(show.target, armedSince) > BOOK_WINDOW_MS) return;
         if (now - lastBookAttemptAt < BOOK_RETRY_MS) return;
         // Never dispatch a tap into another app: at T-0 the 已预约 marker is gone, so this
         // is what keeps the press inside Damai.

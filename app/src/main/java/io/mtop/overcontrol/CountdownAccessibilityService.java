@@ -113,11 +113,9 @@ public class CountdownAccessibilityService extends AccessibilityService {
         // packages other than cn.damai at all — their content is never inspected below.)
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             if (!isDamai) {
-                // Keep the reserved concert — the countdown has to keep running while the
-                // user is elsewhere, since the point is to be back here at T-0. Only the
-                // "on its page" flag, which gates clicking, is dropped.
-                CountdownState.setOnItsPage(false);
-                CountdownState.setDamaiForeground(false);
+                // Left Damai: the pill describes the page you are on, so it stops
+                // describing a concert you are no longer looking at.
+                CountdownState.clear();
                 return;
             }
         }
@@ -189,14 +187,16 @@ public class CountdownAccessibilityService extends AccessibilityService {
         }
 
         if (onSaleAt == null) {
-            // No on-sale time on this screen — a list row, or the detail page scrolled
-            // past its countdown block. Keep whatever is already tracked.
-            CountdownState.setOnItsPage(CountdownState.reserved(now) != null && reservedHere);
+            // No on-sale time on this screen. If the concert being tracked is still named
+            // here, this is the same page merely scrolled past its countdown block — keep
+            // it alive. Otherwise let it go stale, so leaving a concert stops the pill
+            // from advertising it.
+            String tracked = CountdownState.trackedTitle(now);
+            if (tracked != null && texts.contains(tracked)) CountdownState.touch(now);
             return;
         }
 
         CountdownState.observe(onSaleAt, pickTitle(texts), pickDetails(texts), reservedHere, now);
-        CountdownState.setOnItsPage(true);
     }
 
     /** A compact, human-readable snapshot of a screen for {@link ScreenLog}. */
