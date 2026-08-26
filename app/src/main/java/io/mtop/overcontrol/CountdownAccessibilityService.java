@@ -8,15 +8,21 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.ArrayDeque;
-import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
 
 /**
  * Read-only accessibility service scoped to cn.damai (see
  * res/xml/accessibility_service_config.xml). On every window/content change in Damai it
- * walks the currently visible node tree, looks at each TextView's rendered text for one
- * of Damai's own "开抢" on-sale time formats (see {@link CountdownParser}), and records
- * every future on-sale time found — plus a best-effort nearby title — into
- * {@link CountdownState} for {@link OverlayService} to display.
+ * walks the currently visible node tree looking for a concert marked {@value
+ * #RESERVED_MARKER} — the one the user has already reserved. When it finds one it reads
+ * that page's "开抢" on-sale time (see {@link CountdownParser}) plus the title, date, venue
+ * and price, and hands them to {@link CountdownState} for {@link OverlayService} to
+ * display and to click at T-0.
+ *
+ * <p>Pages with no {@value #RESERVED_MARKER} on them are ignored outright, however many
+ * on-sale times they show.
  *
  * The scan itself never performs an action on a node (no click/focus/input) — only
  * getText()/getChild()/getParent(). Pressing things is a separate, explicitly-triggered
@@ -26,10 +32,25 @@ import java.util.HashSet;
 public class CountdownAccessibilityService extends AccessibilityService {
 
     private static final String TARGET_PACKAGE = "cn.damai";
+    /**
+     * What Damai renders once a concert has been reserved, and so the marker for "this is
+     * the concert the user cares about". Before reserving, the same control reads 预约抢票.
+     */
+    private static final String RESERVED_MARKER = "已预约";
     private static final int MAX_NODES_PER_SCAN = 4000;
-    private static final int MAX_LABEL_SEARCH_NODES = 80;
-    private static final int LABEL_SEARCH_ANCESTOR_HOPS = 4;
     private static final long MIN_SCAN_INTERVAL_MS = 800L;
+
+    // "2026.10.10-10.11" — the show's own date, as printed under its name.
+    private static final Pattern FULL_DATE = Pattern.compile(
+            "\\d{4}[.\\-/]\\d{1,2}[.\\-/]\\d{1,2}");
+    // "10月10日" — the fallback when the year isn't spelled out.
+    private static final Pattern DATE_LIKE = Pattern.compile(
+            "\\d{4}[.\\-/]\\d{1,2}[.\\-/]\\d{1,2}|\\d{1,2}月\\d{1,2}日");
+    // A price with an actual number in it. Damai often splits the ¥ into its own node, so
+    // a bare "¥" is not a price — see the rejoin in pickDetails.
+    private static final Pattern PRICE_LIKE = Pattern.compile("¥\\s*\\d");
+    private static final Pattern VENUE_LIKE = Pattern.compile(
+            "体育场|体育馆|中心|剧院|剧场|大剧院|文化宫|广场|馆$");
 
     // The connected service instance, so code outside the accessibility callback (the
     // overlay pill's long-press today) can reach performAction/dispatchGesture through
@@ -37,11 +58,6 @@ public class CountdownAccessibilityService extends AccessibilityService {
     private static volatile CountdownAccessibilityService instance;
 
     private long lastScanAt = 0L;
-    // Class name from the most recent window-state-changed event for cn.damai — Damai's
-    // single-show detail page is a distinct Activity from any list/channel page, and its
-    // bottom "预约抢票"/"立即购票" action bar doesn't reliably expose its text to
-    // accessibility (likely a custom-drawn view), so the Activity itself is the signal.
-    private String currentActivityClassName;
 
     /** The running service, or null if accessibility access isn't currently granted. */
     static CountdownAccessibilityService peek() {
@@ -90,13 +106,16 @@ public class CountdownAccessibilityService extends AccessibilityService {
         // packages other than cn.damai at all — their content is never inspected below.)
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             if (!isDamai) {
-                CountdownState.clear();
+                // Keep the reserved concert — the countdown has to keep running while the
+                // user is elsewhere, since the point is to be back here at T-0. Only the
+                // "on its page" flag, which gates clicking, is dropped.
+                CountdownState.setOnItsPage(false);
+                CountdownState.setDamaiForeground(false);
                 return;
             }
-            CharSequence cls = event.getClassName();
-            currentActivityClassName = cls != null ? cls.toString() : null;
         }
         if (!isDamai) return;
+        CountdownState.setDamaiForeground(true);
 
         long now = System.currentTimeMillis();
         if (now - lastScanAt < MIN_SCAN_INTERVAL_MS) return;
@@ -122,34 +141,29 @@ public class CountdownAccessibilityService extends AccessibilityService {
         }
         if (root == null) return;
 
+        // One pass, collecting everything the decisions below need. Text is gathered in
+        // document order, which is roughly reading order, so the title tends to come
+        // before the date and venue that belong to it.
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
         int visited = 0;
-        HashSet<Long> foundThisScan = new HashSet<>();
-        HashSet<String> titlesThisScan = new HashSet<>();
+        boolean reservedHere = false;
+        Long onSaleAt = null;
+        ArrayList<String> texts = new ArrayList<>();
 
         while (!queue.isEmpty() && visited < MAX_NODES_PER_SCAN) {
             AccessibilityNodeInfo node = queue.poll();
             if (node == null) continue;
             visited++;
 
-            CharSequence text = node.getText();
+            String text = textOf(node);
             if (text != null) {
-                String s = text.toString();
-                if (s.length() >= 6) {
-                    Long t = CountdownParser.parseFutureMillis(s, now);
-                    if (t != null) {
-                        String label = extractLabel(node, s);
-                        CountdownState.observe(t, label, now);
-                        foundThisScan.add(t);
-                    }
+                String trimmed = text.trim();
+                if (!trimmed.isEmpty()) texts.add(trimmed);
+                if (trimmed.contains(RESERVED_MARKER)) reservedHere = true;
+                if (trimmed.length() >= 6 && onSaleAt == null) {
+                    onSaleAt = CountdownParser.parseFutureMillis(trimmed, now);
                 }
-                String trimmed = s.trim();
-                // Collected screen-wide (not just near a date match): a show's detail page
-                // often renders its date as a range ("2026.09.04-09.06") that the parser
-                // above never matches, so the title is the only reliable link back to
-                // whichever show is being tracked — see the label match below.
-                if (isPlausibleTitle(trimmed, null)) titlesThisScan.add(trimmed);
             }
 
             int childCount = node.getChildCount();
@@ -160,72 +174,92 @@ public class CountdownAccessibilityService extends AccessibilityService {
             node.recycle();
         }
 
-        CountdownState.Show nearest = CountdownState.nearest(now);
-        boolean showConfirmed = nearest != null && (foundThisScan.contains(nearest.target)
-                || (nearest.label != null && titlesThisScan.stream()
-                        .anyMatch(t -> t.contains(nearest.label) || nearest.label.contains(t))));
-        boolean onOwnDetailPage = currentActivityClassName != null
-                && currentActivityClassName.contains("projectdetail");
-        CountdownState.setActive(showConfirmed && onOwnDetailPage);
-    }
-
-    /**
-     * Best-effort scrape of the show's title: climbs a few ancestors up from the matched
-     * date/time node (to roughly the enclosing card) and returns the longest plausible
-     * title-like text found in that subtree. Heuristic, not exact — Damai's card layouts
-     * vary, but the title is consistently the longest CJK text near the date in every
-     * layout seen so far.
-     */
-    private static String extractLabel(AccessibilityNodeInfo dateNode, String dateText) {
-        AccessibilityNodeInfo cursor = dateNode;
-        for (int hop = 0; hop < LABEL_SEARCH_ANCESTOR_HOPS; hop++) {
-            AccessibilityNodeInfo parent = cursor.getParent();
-            // Only let go of the current node once there is a valid parent to move to.
-            // Recycling before this check left `cursor` pointing at a recycled node
-            // whenever the climb reached the window root early (getParent() == null), and
-            // it was then both read by findBestLabel and recycled a second time below. On
-            // API 31+ recycle() is a no-op so that was invisible; on API 28 the pool is
-            // real and both the use and the double-recycle throw IllegalStateException —
-            // once per scan, i.e. on every window content change.
-            if (parent == null) break;
-            if (cursor != dateNode) cursor.recycle();
-            cursor = parent;
+        if (!reservedHere) {
+            // Not the reserved concert's page. Leave whatever is already tracked alone —
+            // it is still counting down — but nothing here can be clicked.
+            CountdownState.setOnItsPage(false);
+            return;
         }
-        if (cursor == dateNode) return null; // couldn't climb at all
 
-        String label = findBestLabel(cursor, dateText);
-        cursor.recycle();
-        return label;
+        CountdownState.Show tracked = CountdownState.reserved(now);
+        if (onSaleAt == null) {
+            // Reserved, but this screen doesn't spell out the on-sale time (a list row, or
+            // the detail page after the countdown block has scrolled away). Keep tracking.
+            CountdownState.setOnItsPage(tracked != null);
+            return;
+        }
+
+        CountdownState.observeReserved(onSaleAt, pickTitle(texts), pickDetails(texts), now);
+        CountdownState.setOnItsPage(true);
     }
 
-    private static String findBestLabel(AccessibilityNodeInfo root, String excludeText) {
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
+    /** A node's visible text, falling back to its content-description. */
+    private static String textOf(AccessibilityNodeInfo node) {
+        CharSequence text = node.getText();
+        if (text != null) return text.toString();
+        CharSequence desc = node.getContentDescription();
+        return desc != null ? desc.toString() : null;
+    }
+
+    /** The longest title-shaped string on the page — Damai puts the show name first. */
+    private static String pickTitle(List<String> texts) {
         String best = null;
-        int visited = 0;
-
-        while (!queue.isEmpty() && visited < MAX_LABEL_SEARCH_NODES) {
-            AccessibilityNodeInfo node = queue.poll();
-            if (node == null) continue;
-            visited++;
-
-            CharSequence text = node.getText();
-            if (text != null) {
-                String s = text.toString().trim();
-                if (isPlausibleTitle(s, excludeText) && (best == null || s.length() > best.length())) {
-                    best = s;
-                }
-            }
-
-            int childCount = node.getChildCount();
-            for (int i = 0; i < childCount; i++) {
-                AccessibilityNodeInfo child = node.getChild(i);
-                if (child != null) queue.add(child);
-            }
-            if (node != root) node.recycle();
+        for (String t : texts) {
+            if (!isPlausibleTitle(t, null)) continue;
+            if (best == null || t.length() > best.length()) best = t;
         }
         return best;
     }
+
+    /**
+     * Date, venue and price for the expanded pill, in that order and at most one of each.
+     * Matched by shape rather than by view id: the ids differ between Damai's list rows
+     * and its detail page, but these three always look the same wherever they appear.
+     */
+    private static List<String> pickDetails(List<String> texts) {
+        String date = null, venue = null, price = null;
+
+        // The show's own date first, and never an on-sale line: "08月31日 11:50开抢" also
+        // looks like a date, but it is the countdown the pill already displays, so
+        // showing it as the concert's date would be both wrong and redundant.
+        for (String t : texts) {
+            if (t.length() > 40 || isOnSaleLine(t)) continue;
+            if (FULL_DATE.matcher(t).find()) { date = t; break; }
+        }
+
+        for (int i = 0; i < texts.size(); i++) {
+            String t = texts.get(i);
+            if (t.length() > 40) continue;
+            if (date == null && !isOnSaleLine(t) && DATE_LIKE.matcher(t).find()) date = t;
+            if (venue == null && VENUE_LIKE.matcher(t).find()) venue = t;
+            if (price == null) price = priceAt(texts, i);
+        }
+
+        ArrayList<String> details = new ArrayList<>(3);
+        if (date != null) details.add(date);
+        if (venue != null) details.add(venue);
+        if (price != null) details.add(price);
+        return details;
+    }
+
+    /**
+     * The price at this position, rejoining the currency symbol with its number when Damai
+     * renders them as two nodes — which it does on the detail page, where the price reads
+     * "¥380－980" on screen but reaches us as "¥" followed by "380－980".
+     */
+    private static String priceAt(List<String> texts, int i) {
+        String t = texts.get(i);
+        if (PRICE_LIKE.matcher(t).find()) return t;
+        if (!t.equals("¥") || i + 1 >= texts.size()) return null;
+        String next = texts.get(i + 1);
+        return !next.isEmpty() && Character.isDigit(next.charAt(0)) ? t + next : null;
+    }
+
+    /** True for Damai's "…开抢/开票/开售" lines, which announce the sale, not the show. */
+    private static boolean isOnSaleLine(String t) {
+        return t.contains("开抢") || t.contains("开票") || t.contains("开售");
+    }
+
 
     private static boolean isPlausibleTitle(String s, String excludeText) {
         if (s.isEmpty() || s.equals(excludeText)) return false;

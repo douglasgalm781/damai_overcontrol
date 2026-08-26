@@ -141,8 +141,10 @@ public class MainActivity extends Activity {
         card.addView(bullet("轻触", "展开/收起演出名称  Tap to expand the show's name"));
         card.addView(bullet("拖动", "移动悬浮窗位置  Drag to move the pill"));
         card.addView(bullet("长按", "立即点击当前页面的购票按钮  Long-press to press the buy button now"));
-        card.addView(bullet("🟢 5 秒", "在演出详情页持续 5 秒后自动点击“预约抢票”"
-                + "  Auto-presses 预约抢票 after 5s on the show's page"));
+        card.addView(bullet("🟢 已预约", "自动跟踪标有“已预约”的演出并显示其开票倒计时"
+                + "  Tracks the show marked 已预约 and counts down to its on-sale time"));
+        card.addView(bullet("倒计时归零", "自动点击该演出的“立即预订”"
+                + "  Presses 立即预订 for that show the moment the countdown hits zero"));
         return card;
     }
 

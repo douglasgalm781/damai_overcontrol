@@ -8,7 +8,7 @@ reader would, and reformats it into a countdown.
 
 ## How it works
 
-Damai renders its on-sale times as plain text in a handful of fixed formats — see
+Damai renders its on-sale times as plain text — see
 `reference/decompiled/sources/com/alibaba/pictures/bricks/util/DateUtil.java` and
 `.../component/reservation/ReservationBean.java`:
 
@@ -17,19 +17,24 @@ Damai renders its on-sale times as plain text in a handful of fixed formats — 
 后天 10:00 开抢      08-20 10:00 开抢
 ```
 
-`CountdownAccessibilityService` is scoped (via `accessibility_service_config.xml`) to
-only receive events from `cn.damai`. On every window/content change there it walks the
-currently visible node tree, checks each `TextView`'s rendered text against those
-formats (`CountdownParser`), and records every future on-sale time it finds into
-`CountdownState` — not just the soonest one on the current screen. The scan itself never
-taps, focuses, or types into anything — read-only `getText()`/`getChild()`.
+`CountdownAccessibilityService` walks the visible node tree on every window/content
+change in `cn.damai` looking for **`已预约`** — Damai's label for a concert you have
+already reserved. That badge is the user stating which concert matters, so it, and only
+it, is tracked; every other on-sale time on screen is ignored.
 
-`CountdownState` remembers every show seen this way, keyed by its on-sale time, and
-always reports the soonest one that (a) hasn't passed yet and (b) was re-confirmed on
-screen within the last 24h (a stale/rescheduled show falls out on its own, without the
-overlay ever showing a wrong frozen time). This is what makes the overlay move on to
-the next-nearest show automatically once the current one's sale time passes — even if
-you've since navigated away from the screen that showed it.
+> An earlier version tracked whichever on-sale time was soonest across everything it had
+> ever seen. That guessed at intent, and the soonest show on screen is rarely the one you
+> care about.
+
+When a page carries the marker, the same pass reads its on-sale time (`CountdownParser`)
+plus the title, date, venue and price. Details are matched by *shape* rather than view id
+— ids differ between Damai's list rows and its detail page, but a date, a venue and a `¥`
+price look the same wherever they appear. `CountdownState` holds exactly one such show,
+merging new sightings so a page that omits the venue doesn't blank it out.
+
+Unlike the old behaviour, leaving Damai no longer discards it: the countdown has to keep
+running while the user is in another app, since the entire point is to be back on the page
+at T-0. A stale reservation ages out after 24h instead.
 
 `OverlayService` is a small foreground service that draws a draggable pill
 (`TYPE_APPLICATION_OVERLAY`) and ticks it once a second from that shared state. It
@@ -115,6 +120,27 @@ under a config without `canPerformGestures`, taps are silently dropped by the sy
 until accessibility access is toggled off and back on — the check turns that into a clear
 message instead of a mystery no-op.
 
+### Match button labels, not substrings
+
+`clickByText` requires the node's text to *be* the label — equal to it, or containing it
+while no more than `LABEL_SLACK` characters longer. A plain `contains` is not safe: the
+detail page carries the sentence 实名制购票和入场 in its terms row, which contains 购票, and
+a contains-match pressed that row and opened the 服务说明 sheet instead of the buy button.
+Observed on device; the generic `购票` entry was dropped from `CLICK_TARGETS` as well, since
+a two-character label is nearly all false positives.
+
+### Details are matched by shape, and the price arrives in pieces
+
+`pickDetails` takes the show's own date, its venue and its price. Two traps, both found on
+a real page:
+
+- `08月31日 11:50开抢` also looks like a date. It is the on-sale line — already the
+  countdown — so any text containing 开抢/开票/开售 is excluded, and a full `2026.10.10-10.11`
+  is preferred over a bare `月/日`.
+- The price reaches accessibility as **two** nodes: `¥` and `380－980`. Matching `¥` alone
+  yielded a detail line reading just "¥", so `priceAt` rejoins a lone currency symbol with
+  the following text when that starts with a digit.
+
 ### The 预约抢票 button has no node at all
 
 Measured on `ProjectDetailActivity` (Android 13, 1220×2712), by dumping the tree with
@@ -140,21 +166,30 @@ makes an unexpected layout fail instead of tapping something arbitrary.
 
 Two triggers are wired up:
 
-- **Auto: 5s of 🟢.** The pill's 🟢 means the page on screen is the tracked show's own
-  page (`CountdownState.isActive()`). Once that has held for `ACTIVE_DWELL_MS` = 5s
-  without interruption, `OverlayService.maybeAutoClick` presses `AUTO_CLICK_TARGET`
-  (`预约抢票`) on that page. The dwell is what keeps it off pages merely scrolled past —
-  a single active scan isn't enough, the page has to still be there 5s later. The pill
-  shows the countdown to it (`🟢 3s` → `🟢 ▶` → `🟢 ✔`), and a toast confirms the press.
-  At most one successful press per 🟢 streak; it rearms when the status falls back to ⚪.
-  A miss (target not on screen yet) retries every 2s while the streak lasts, and the first
-  miss of a streak dumps the tree to logcat (`DUMP_ON_MISS`) so a Damai redesign that
-  breaks the click leaves evidence behind.
+- **Auto: at T-0.** When the tracked concert's countdown reaches zero, Damai relabels its
+  button from `已预约` to `立即预订` and `OverlayService.maybeBookNow` presses it. There is
+  no dwell — T-0 *is* the moment, and a second late costs a ticket — so it fires on the
+  first tick at or after the target, then retries every `BOOK_RETRY_MS` (1.5s) for
+  `BOOK_WINDOW_MS` (2 min), because Damai doesn't always flip the button the instant the
+  clock runs out. One success per concert, keyed by on-sale time so a different
+  reservation starts over. It is gated on Damai being foreground: at T-0 the `已预约`
+  marker is gone, so that is what keeps the tap from landing in another app. A miss dumps
+  the tree to logcat (`DUMP_ON_MISS`) so a Damai redesign leaves evidence behind.
 - **Manual: long-press the pill.** Presses the first match in
   `OverlayService.CLICK_TARGETS` immediately, no dwell — that array is the thing to edit
   when building a click feature for a different page.
 
-Both report via toast whether anything matched.
+Both report via toast whether anything matched. A successful booking press also plays
+`ClickEffectView` around the pill — three staggered rings expanding through a soft glow
+with a check badge popping in the centre. It gets **its own** overlay window rather than
+living inside the pill's: the burst is far wider than the pill, and growing the pill's
+window to fit would leave a rectangle of invisible padding swallowing taps meant for Damai
+underneath. That window is `FLAG_NOT_TOUCHABLE` and removes itself when the animation
+ends.
+
+The pill shows `⚪` while waiting for a reserved show and `🟢` once it is tracking one,
+then `🎯 抢票中…` → `✅ 已抢` through the booking. Expanded, it lists the concert's title,
+date, venue and price.
 
 ## Requires
 

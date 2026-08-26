@@ -41,6 +41,8 @@ final class NodeActions {
     /** How far up from a matched text node to look for something actually clickable. */
     private static final int CLICKABLE_ANCESTOR_HOPS = 6;
     private static final long TAP_DURATION_MS = 40L;
+    /** How much longer than the label itself a matching text may be. */
+    private static final int LABEL_SLACK = 3;
 
     private NodeActions() {}
 
@@ -327,10 +329,23 @@ final class NodeActions {
     }
 
     private static boolean containsText(AccessibilityNodeInfo node, String needle) {
-        CharSequence text = node.getText();
-        if (text != null && text.toString().contains(needle)) return true;
-        CharSequence desc = node.getContentDescription();
-        return desc != null && desc.toString().contains(needle);
+        return isLabel(node.getText(), needle) || isLabel(node.getContentDescription(), needle);
+    }
+
+    /**
+     * Whether this text is the button label {@code needle} — an exact match, or a
+     * containing string barely longer than the label itself.
+     *
+     * <p>Plain "contains" is not safe here. Damai's detail page carries the sentence
+     * 实名制购票和入场 in its terms row, which contains 购票; a contains-match pressed that
+     * row and opened the 服务说明 sheet instead of the buy button. A real button's label is
+     * essentially just the label, so length is what separates the two.
+     */
+    private static boolean isLabel(CharSequence cs, String needle) {
+        if (cs == null) return false;
+        String s = cs.toString().trim();
+        return s.equals(needle)
+                || (s.contains(needle) && s.length() <= needle.length() + LABEL_SLACK);
     }
 
     private static AccessibilityNodeInfo rootOf(AccessibilityService svc) {

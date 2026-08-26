@@ -32,9 +32,9 @@ import android.widget.Toast;
  *
  * <p>The pill is also the trigger for the click feature: tap = expand/collapse, drag =
  * move, long-press = press {@link #CLICK_TARGETS} on whatever Damai page is on screen via
- * {@link NodeActions}. On top of that manual press, {@link #maybeAutoClick} fires
- * {@value #AUTO_CLICK_TARGET} on its own once the pill has been 🟢 for
- * {@value #ACTIVE_DWELL_MS}ms straight.
+ * {@link NodeActions}. On top of that manual press, {@link #maybeBookNow} presses
+ * {@value #BOOK_NOW_TARGET} on its own the moment the tracked concert's countdown reaches
+ * zero and Damai swaps its button over to it.
  */
 public class OverlayService extends Service {
 
@@ -59,17 +59,19 @@ public class OverlayService extends Service {
      * full listing of every node, id and bounds on screen.
      */
     private static final String[] CLICK_TARGETS = {
+            "立即预订",
             "立即购票",
             "预约抢票",
-            "立即预订",
             "特惠购票",
-            "购票",
     };
 
-    /** What {@link #maybeAutoClick} presses by itself once the dwell below has elapsed. */
-    private static final String AUTO_CLICK_TARGET = "预约抢票";
     /**
-     * Fallback for {@link #AUTO_CLICK_TARGET}, because on ProjectDetailActivity that button
+     * What {@link #maybeBookNow} presses by itself at T-0. Damai relabels the reserved
+     * concert's button from 已预约 to this the instant tickets go on sale.
+     */
+    private static final String BOOK_NOW_TARGET = "立即预订";
+    /**
+     * Fallback for {@link #BOOK_NOW_TARGET}, because on ProjectDetailActivity that button
      * puts no node in the accessibility tree at all — verified by dump: the only node
      * overlapping it is the root FrameLayout. Its neighbours in the bottom bar (帮助, 想看)
      * share this id prefix and are exposed, so the button is located as the rest of the bar
@@ -78,15 +80,14 @@ public class OverlayService extends Service {
     private static final String AUTO_CLICK_ANCHOR_ID_PREFIX = "cn.damai:id/project_item_bottom_";
     /** The button should occupy most of the bar's width; well under this means a different layout. */
     private static final float AUTO_CLICK_MIN_GAP_FRACTION = 0.4f;
+    /** Gap between attempts while the button hasn't appeared yet. */
+    private static final long BOOK_RETRY_MS = 1500L;
     /**
-     * How long the status has to stay 🟢 — i.e. the page on screen keeps re-confirming the
-     * tracked show, see {@link CountdownState#isActive()} — before the auto-click fires.
-     * The dwell is what keeps it off pages merely passed through while scrolling: a
-     * single stray active scan isn't enough, the page has to still be there 5s later.
+     * How long after T-0 to keep trying. Damai doesn't always flip the button the very
+     * second the clock runs out, and the user may still be navigating back to the page —
+     * but retrying forever would keep tapping a page that has clearly moved on.
      */
-    private static final long ACTIVE_DWELL_MS = 5000L;
-    /** Gap between attempts while the target hasn't been found yet on an active page. */
-    private static final long AUTO_CLICK_RETRY_MS = 2000L;
+    private static final long BOOK_WINDOW_MS = 120_000L;
 
     /** Side margin of the pill's resting position. */
     private static final int EDGE_MARGIN_DP = 16;
@@ -127,13 +128,11 @@ public class OverlayService extends Service {
     private boolean longPressFired = false; // so the following ACTION_UP isn't also a tap
     private final Runnable longPress = this::performTargetClick;
 
-    // Auto-click bookkeeping. activeSince is when the current 🟢 streak was first seen by
-    // the ticker (0 = not active right now); both reset the moment the status drops back
-    // to ⚪, so leaving the page and coming back arms a fresh 5s dwell.
-    private long activeSince = 0L;
-    private long lastAutoAttemptAt = 0L;
-    private boolean autoClicked = false; // already pressed during this 🟢 streak
-    private boolean dumpedThisStreak = false;
+    // Booking bookkeeping, keyed by the tracked concert's on-sale time so that a different
+    // reservation (or a rescheduled one) starts over with a clean slate.
+    private long bookedTarget = 0L;      // on-sale time we have already pressed for
+    private long lastBookAttemptAt = 0L;
+    private boolean dumpedThisTarget = false;
     private int lastPillHeight = -1;
     private int lastPillWidth = -1;
 
@@ -146,7 +145,7 @@ public class OverlayService extends Service {
             // predict, so it is treated as untrusted: log and keep ticking.
             try {
                 long now = System.currentTimeMillis();
-                maybeAutoClick(now);
+                maybeBookNow(now);
                 render(now);
             } catch (Throwable t) {
                 Log.e(NodeActions.TAG, "tick failed", t);
@@ -312,60 +311,66 @@ public class OverlayService extends Service {
     };
 
     /**
-     * Presses {@value #AUTO_CLICK_TARGET} once the status has been 🟢 for
-     * {@link #ACTIVE_DWELL_MS} without interruption. Called once a second from the ticker,
-     * so the dwell is measured to ±1s — which is also why it can't fire on a page that was
-     * only briefly active.
+     * Presses {@value #BOOK_NOW_TARGET} once the tracked concert's on-sale time has
+     * arrived. Called once a second from the ticker.
      *
-     * <p>At most one successful press per 🟢 streak: after a hit it stays quiet until the
-     * status drops to ⚪ (which it does as soon as the press navigates away from the
-     * show's own page). A miss — target not on screen yet — is retried every
-     * {@link #AUTO_CLICK_RETRY_MS} for as long as the streak lasts.
+     * <p>Unlike the dwell this replaces, there is nothing to wait for: T-0 is the moment,
+     * and being a second late costs a ticket. So it fires on the first tick at or after
+     * the target and then retries every {@link #BOOK_RETRY_MS} for {@link
+     * #BOOK_WINDOW_MS}, because Damai does not always relabel the button the instant the
+     * clock runs out. One success per concert; a different reservation starts over.
      */
-    private void maybeAutoClick(long now) {
-        if (!CountdownState.isActive()) { // streak over (or never started) — rearm
-            activeSince = 0L;
-            autoClicked = false;
-            dumpedThisStreak = false;
-            return;
-        }
-        if (activeSince == 0L) activeSince = now;
-        if (autoClicked) return;
-        if (now - activeSince < ACTIVE_DWELL_MS) return;
-        if (now - lastAutoAttemptAt < AUTO_CLICK_RETRY_MS) return;
+    private void maybeBookNow(long now) {
+        CountdownState.Show show = CountdownState.reserved(now);
+        if (show == null) return;
+
+        if (show.target != bookedTarget) dumpedThisTarget = false; // new concert, new slate
+        if (now < show.target) return;                             // not yet
+        if (bookedTarget == show.target) return;                   // already pressed
+        if (now - show.target > BOOK_WINDOW_MS) return;             // window closed
+        if (now - lastBookAttemptAt < BOOK_RETRY_MS) return;
+        // Never dispatch a tap into another app: at T-0 the 已预约 marker is gone, so this
+        // is what keeps the press inside Damai.
+        if (!CountdownState.isDamaiForeground()) return;
 
         CountdownAccessibilityService svc = CountdownAccessibilityService.peek();
         if (svc == null) return; // accessibility access revoked; nothing to click through
-        lastAutoAttemptAt = now;
+        lastBookAttemptAt = now;
         if (!NodeActions.hasGestureCapability(svc)) {
-            if (!dumpedThisStreak) { // once per streak, same as the miss dump
-                dumpedThisStreak = true;
+            if (!dumpedThisTarget) {
+                dumpedThisTarget = true;
                 toast("请关闭再重新开启读屏权限 Turn accessibility access off and on again");
             }
             return;
         }
+
+        long target = show.target;
         clickWithPillHidden(() -> {
-            // Try the honest route first — it's the one that survives a Damai redesign,
-            // and other pages (and older builds) do expose the button as a real node.
-            boolean clicked = NodeActions.clickByText(svc, AUTO_CLICK_TARGET)
+            // By name first — that survives a Damai redesign. The coordinate fallback is
+            // only reached on the detail page, whose button exposes no node at all.
+            boolean clicked = NodeActions.clickByText(svc, BOOK_NOW_TARGET)
                     || NodeActions.tapBesideAnchors(
                             svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
             if (clicked) {
-                autoClicked = true;
-                toast("已自动点击 Auto-clicked " + AUTO_CLICK_TARGET);
-            } else if (DUMP_ON_MISS && !dumpedThisStreak) {
-                dumpedThisStreak = true;
+                bookedTarget = target;
+                showClickEffect();
+                toast("已点击 " + BOOK_NOW_TARGET);
+            } else if (DUMP_ON_MISS && !dumpedThisTarget) {
+                dumpedThisTarget = true;
                 NodeActions.dumpScreen(svc);
             }
         });
     }
 
-    /** " 5s" / " ▶" appended to the status dot, so the pending auto-click is visible. */
-    private String autoClickSuffix(long now) {
-        if (activeSince == 0L) return "";
-        if (autoClicked) return " ✔";
-        long left = ACTIVE_DWELL_MS - (now - activeSince);
-        return left > 0 ? " " + ((left + 999) / 1000) + "s" : " ▶";
+    /** Plays the burst around the pill, once it is back on screen after the tap. */
+    private void showClickEffect() {
+        handler.postDelayed(() -> {
+            if (pill == null || wm == null) return;
+            int[] loc = new int[2];
+            pill.getLocationOnScreen(loc);
+            ClickEffectView.burst(this, wm,
+                    loc[0] + pill.getWidth() / 2, loc[1] + pill.getHeight() / 2);
+        }, TAP_HIDE_TOTAL_MS - TAP_HIDE_LEAD_MS);
     }
 
     private boolean movedBeyondSlop(MotionEvent ev) {
@@ -394,6 +399,7 @@ public class OverlayService extends Service {
             boolean clicked = NodeActions.clickByText(svc, CLICK_TARGETS)
                     || NodeActions.tapBesideAnchors(
                             svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
+            if (clicked) showClickEffect();
             toast(clicked
                     ? "已点击 Clicked"
                     : "未找到可点击目标 No target found on screen");
@@ -418,25 +424,19 @@ public class OverlayService extends Service {
 
     private void render(long now) {
         if (pill == null) return;
-        CountdownState.Show show = CountdownState.nearest(now);
-        // 🟢 = the page on screen right now is this show's own page (just reconfirmed it).
-        // ⚪ = tracked from an earlier screen — still trusted, just not what's showing now.
-        String status = CountdownState.isActive() ? "🟢" : "⚪";
-        status += autoClickSuffix(now);
+        CountdownState.Show show = CountdownState.reserved(now);
 
         String text;
         if (show == null) {
-            text = status + " 等待数据 Waiting…";
+            // Nothing reserved has been seen yet. Opening the reserved concert's page in
+            // Damai is what starts the tracking.
+            text = "⚪ 等待已预约演出\nWaiting for a reserved show";
         } else {
-            long rem = show.target - now;
-            if (rem <= 0) {
-                text = "🔴 已开票 On sale";
-            } else if (expanded) {
-                String label = show.label != null ? show.label : "详情暂缺 No title captured";
-                text = status + " " + label + "\n开票倒计时 Starts in\n" + fmt(rem);
-            } else {
-                text = status + " 开票倒计时 Starts in\n" + fmt(rem);
-            }
+            long remaining = show.target - now;
+            // 🟢 means: locked onto the concert you reserved. It stays green while the
+            // user is off in another app, because the countdown does too.
+            String head = remaining > 0 ? "🟢 开票倒计时 Starts in\n" + fmt(remaining) : onSaleLine(now, show);
+            text = expanded ? head + "\n" + describe(show) : head;
         }
         pill.setText(text);
         // Expanding to show the title makes the pill taller, and it grows downward from
@@ -452,6 +452,22 @@ public class OverlayService extends Service {
             clampToScreen();
             applyLayout();
         });
+    }
+
+    /** What the pill says from T-0 onward: pressing, pressed, or the window has closed. */
+    private String onSaleLine(long now, CountdownState.Show show) {
+        if (bookedTarget == show.target) return "✅ 已抢 Booked";
+        if (now - show.target > BOOK_WINDOW_MS) return "🔴 已开售 On sale";
+        return "🎯 抢票中… Booking…";
+    }
+
+    /** The expanded pill: which concert this is, and everything scraped about it. */
+    private static String describe(CountdownState.Show show) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("— — —\n");
+        sb.append(show.title != null ? show.title : "演出名称暂缺 No title captured");
+        for (String detail : show.details) sb.append('\n').append(detail);
+        return sb.toString();
     }
 
     private static String fmt(long ms) {
