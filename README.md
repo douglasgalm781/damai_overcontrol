@@ -36,6 +36,26 @@ you've since navigated away from the screen that showed it.
 keeps running independent of Damai's lifecycle, surviving it being backgrounded or
 killed.
 
+The pill rests at the bottom-left, `BOTTOM_MARGIN_DP` above the bottom edge so it clears
+Damai's own action bar. Its window uses `TOP|START` gravity regardless — that keeps the
+drag maths aligned with `getRawY()` — with the resting position computed from the measured
+height once the first layout pass has run. Drags are clamped to the screen (recomputed
+from the touch anchor each move, so it un-sticks from an edge properly), and the pill
+re-clamps whenever expanding makes it taller near the bottom.
+
+Because it is an overlay it sits **above** Damai, so an injected tap landing inside the
+pill would press the pill instead of the button underneath. Every click therefore runs
+through `clickWithPillHidden`, which hides the pill, waits `TAP_HIDE_LEAD_MS` for the
+window to drop out of hit-testing, dispatches, and restores it. That is what makes the
+click correct no matter where the pill has been dragged.
+
+`MainActivity` is the setup and control surface: permission rows with live ON/OFF chips,
+what the gestures do, a show/hide toggle for the pill, and Exit. **Exit means exit** — it
+stops the overlay *and* calls `disableSelf()` on the accessibility service, so nothing
+keeps reading the screen after the user has closed the app. A quieter "hide pill" option
+is offered alongside for when the permission should stay granted, since re-granting it
+means a trip to system settings.
+
 ## Clicking (`NodeActions`)
 
 Pressing things is a separate, explicitly-triggered concern from the countdown scan.

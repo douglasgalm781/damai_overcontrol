@@ -48,6 +48,23 @@ public class CountdownAccessibilityService extends AccessibilityService {
         return instance;
     }
 
+    /**
+     * Turns this accessibility service off from inside the app, so "exit" can actually
+     * stop the screen reading rather than just hiding the overlay and leaving a service
+     * running that the user believes they closed. Re-enabling needs the system
+     * accessibility screen — an app cannot grant itself the permission back.
+     *
+     * @return false if the service wasn't running to begin with
+     */
+    static boolean disableService() {
+        CountdownAccessibilityService svc = instance;
+        if (svc == null) return false;
+        CountdownState.clear();
+        svc.disableSelf(); // API 24, and minSdk is 24
+        instance = null;
+        return true;
+    }
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();

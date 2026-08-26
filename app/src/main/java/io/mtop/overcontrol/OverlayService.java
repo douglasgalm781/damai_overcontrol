@@ -16,7 +16,9 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
+import android.util.DisplayMetrics;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.TextView;
@@ -37,6 +39,12 @@ import android.widget.Toast;
 public class OverlayService extends Service {
 
     static final String ACTION_STOP = "io.mtop.overcontrol.action.STOP";
+
+    /** Whether the overlay service is up (and so the pill is on screen). */
+    static boolean isRunning() {
+        return running;
+    }
+
     private static final String CHANNEL_ID = "overcontrol_status";
     private static final int NOTIF_ID = 1;
     private static final float TAP_SLOP_DP = 14f;
@@ -79,6 +87,23 @@ public class OverlayService extends Service {
     private static final long ACTIVE_DWELL_MS = 5000L;
     /** Gap between attempts while the target hasn't been found yet on an active page. */
     private static final long AUTO_CLICK_RETRY_MS = 2000L;
+
+    /** Side margin of the pill's resting position. */
+    private static final int EDGE_MARGIN_DP = 16;
+    /**
+     * How far above the bottom of the screen the pill starts. Enough to clear Damai's own
+     * bottom action bar (~63dp on the devices measured), so the pill's resting place never
+     * sits on top of the very button the auto-click is aiming for.
+     */
+    private static final int BOTTOM_MARGIN_DP = 96;
+    /**
+     * The pill is hidden around a synthesized tap. It is an overlay window, so it sits
+     * above Damai and would receive an injected tap that landed inside it — the click
+     * would silently press our own pill instead of the button. Hiding it is what makes the
+     * click work no matter where the pill has been dragged.
+     */
+    private static final long TAP_HIDE_LEAD_MS = 100L;  // let the window relayout first
+    private static final long TAP_HIDE_TOTAL_MS = 600L; // then restore well after the tap
     /**
      * On the first failed auto-click of a 🟢 streak, log the whole node tree via
      * {@link NodeActions#dumpScreen} ({@code adb logcat -s Overcontrol}). This is the only
@@ -87,6 +112,11 @@ public class OverlayService extends Service {
      * idle. Once per streak, so a page that simply lacks the button doesn't spam.
      */
     private static final boolean DUMP_ON_MISS = true;
+
+    // Lets MainActivity show whether the pill is up, and offer to start it again — the
+    // only other thing that ever starts this service is the accessibility service
+    // connecting, so without this, hiding the pill would be a one-way door.
+    private static volatile boolean running = false;
 
     private WindowManager wm;
     private TextView pill;
@@ -104,6 +134,8 @@ public class OverlayService extends Service {
     private long lastAutoAttemptAt = 0L;
     private boolean autoClicked = false; // already pressed during this 🟢 streak
     private boolean dumpedThisStreak = false;
+    private int lastPillHeight = -1;
+    private int lastPillWidth = -1;
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -127,6 +159,7 @@ public class OverlayService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        running = true;
         CrashLog.install(this);
         startForeground(NOTIF_ID, buildNotification());
         addOverlay();
@@ -144,8 +177,10 @@ public class OverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        running = false;
         handler.removeCallbacks(ticker);
         handler.removeCallbacks(longPress);
+        handler.removeCallbacks(showPill);
         removeOverlay();
         super.onDestroy();
     }
@@ -182,9 +217,11 @@ public class OverlayService extends Service {
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
+        // TOP|START keeps the drag maths natural (y grows downward, matching getRawY);
+        // the resting place near the bottom is applied once the pill has a measured height.
         lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = dp(24);
-        lp.y = dp(120);
+        lp.x = dp(EDGE_MARGIN_DP);
+        lp.y = dp(BOTTOM_MARGIN_DP);
 
         pill.setOnTouchListener((v, ev) -> {
             switch (ev.getActionMasked()) {
@@ -200,9 +237,8 @@ public class OverlayService extends Service {
                     lp.x = (int) (drag[2] + (ev.getRawX() - drag[0]));
                     lp.y = (int) (drag[3] + (ev.getRawY() - drag[1]));
                     if (movedBeyondSlop(ev)) handler.removeCallbacks(longPress); // it's a drag
-                    try {
-                        wm.updateViewLayout(pill, lp);
-                    } catch (Exception ignored) {}
+                    clampToScreen();
+                    applyLayout();
                     return true;
                 case MotionEvent.ACTION_UP:
                     handler.removeCallbacks(longPress);
@@ -222,7 +258,58 @@ public class OverlayService extends Service {
         try {
             wm.addView(pill, lp);
         } catch (Exception ignored) {}
+        // WRAP_CONTENT means the height isn't known until the first layout pass.
+        pill.post(this::restAtBottom);
     }
+
+    /** Parks the pill near the bottom-left, above Damai's action bar. */
+    private void restAtBottom() {
+        if (pill == null || lp == null) return;
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        lp.x = dp(EDGE_MARGIN_DP);
+        lp.y = dm.heightPixels - pill.getHeight() - dp(BOTTOM_MARGIN_DP);
+        clampToScreen();
+        applyLayout();
+    }
+
+    /** Keeps the pill fully on screen, so it can't be dragged out of reach. */
+    private void clampToScreen() {
+        if (pill == null || lp == null) return;
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        int maxX = Math.max(0, dm.widthPixels - pill.getWidth());
+        int maxY = Math.max(0, dm.heightPixels - pill.getHeight());
+        lp.x = Math.min(Math.max(0, lp.x), maxX);
+        lp.y = Math.min(Math.max(0, lp.y), maxY);
+    }
+
+    private void applyLayout() {
+        try {
+            wm.updateViewLayout(pill, lp);
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Runs a click with the pill hidden, so an injected tap can never land on our own
+     * overlay instead of Damai. The lead delay gives the window manager a chance to drop
+     * the pill out of hit-testing before the gesture is dispatched.
+     */
+    private void clickWithPillHidden(Runnable click) {
+        if (pill != null) pill.setVisibility(View.GONE);
+        handler.removeCallbacks(showPill);
+        handler.postDelayed(() -> {
+            try {
+                click.run();
+            } catch (Throwable t) {
+                Log.e(NodeActions.TAG, "click failed", t);
+            } finally {
+                handler.postDelayed(showPill, TAP_HIDE_TOTAL_MS - TAP_HIDE_LEAD_MS);
+            }
+        }, TAP_HIDE_LEAD_MS);
+    }
+
+    private final Runnable showPill = () -> {
+        if (pill != null) pill.setVisibility(View.VISIBLE);
+    };
 
     /**
      * Presses {@value #AUTO_CLICK_TARGET} once the status has been 🟢 for
@@ -257,18 +344,20 @@ public class OverlayService extends Service {
             }
             return;
         }
-        // Try the honest route first — it's the one that survives a Damai redesign, and
-        // other pages (and older builds) do expose the button as a real node.
-        boolean clicked = NodeActions.clickByText(svc, AUTO_CLICK_TARGET)
-                || NodeActions.tapBesideAnchors(
-                        svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
-        if (clicked) {
-            autoClicked = true;
-            toast("已自动点击 Auto-clicked " + AUTO_CLICK_TARGET);
-        } else if (DUMP_ON_MISS && !dumpedThisStreak) {
-            dumpedThisStreak = true;
-            NodeActions.dumpScreen(svc);
-        }
+        clickWithPillHidden(() -> {
+            // Try the honest route first — it's the one that survives a Damai redesign,
+            // and other pages (and older builds) do expose the button as a real node.
+            boolean clicked = NodeActions.clickByText(svc, AUTO_CLICK_TARGET)
+                    || NodeActions.tapBesideAnchors(
+                            svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
+            if (clicked) {
+                autoClicked = true;
+                toast("已自动点击 Auto-clicked " + AUTO_CLICK_TARGET);
+            } else if (DUMP_ON_MISS && !dumpedThisStreak) {
+                dumpedThisStreak = true;
+                NodeActions.dumpScreen(svc);
+            }
+        });
     }
 
     /** " 5s" / " ▶" appended to the status dot, so the pending auto-click is visible. */
@@ -301,19 +390,14 @@ public class OverlayService extends Service {
             toast("请关闭再重新开启读屏权限 Turn accessibility access off and on again");
             return;
         }
-        boolean clicked;
-        try {
-            clicked = NodeActions.clickByText(svc, CLICK_TARGETS)
+        clickWithPillHidden(() -> {
+            boolean clicked = NodeActions.clickByText(svc, CLICK_TARGETS)
                     || NodeActions.tapBesideAnchors(
                             svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
-        } catch (Throwable t) {
-            Log.e(NodeActions.TAG, "manual click failed", t);
-            toast("点击出错 Click failed — see logcat");
-            return;
-        }
-        toast(clicked
-                ? "已点击 Clicked"
-                : "未找到可点击目标 No target found on screen");
+            toast(clicked
+                    ? "已点击 Clicked"
+                    : "未找到可点击目标 No target found on screen");
+        });
     }
 
     private void toast(String msg) {
@@ -355,6 +439,19 @@ public class OverlayService extends Service {
             }
         }
         pill.setText(text);
+        // Expanding to show the title makes the pill taller, and it grows downward from
+        // lp.y — parked near the bottom that would run it off the screen. Re-clamp, but
+        // only when the size actually changed, so the once-a-second tick doesn't churn
+        // through a window relayout every time the digits change.
+        pill.post(() -> {
+            if (pill == null) return;
+            int h = pill.getHeight(), w = pill.getWidth();
+            if (h == lastPillHeight && w == lastPillWidth) return;
+            lastPillHeight = h;
+            lastPillWidth = w;
+            clampToScreen();
+            applyLayout();
+        });
     }
 
     private static String fmt(long ms) {
