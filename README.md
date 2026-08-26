@@ -57,6 +57,22 @@ node cached from an earlier scan — those are recycled and their bounds go stal
 2. Failing that, a synthesized tap at the node's on-screen centre via `dispatchGesture` —
    this is what `android:canPerformGestures="true"` in the service config is for.
 
+### Gesture taps and old Android
+
+`tapAt` drags one pixel instead of emitting a move-only path. Android 9 (API 28) and
+older decide whether a stroke path is empty from its **bounds**, and a lone `moveTo` has
+bounds `(x,y,x,y)` — zero width and height, so `RectF.isEmpty()` is true and
+`StrokeDescription` throws `IllegalArgumentException("Path is empty")`. Newer releases
+test `Path.isEmpty()`, where the `moveTo` counts as a verb and the identical path is
+accepted. A move-only tap therefore works on API 33 and crashes on API 28.
+
+`tapAt` also refuses negative/NaN coordinates and checks
+`CAPABILITY_CAN_PERFORM_GESTURES` before dispatching. That capability is bound when the
+user *enables* the service, so after an in-place update of a service that was enabled
+under a config without `canPerformGestures`, taps are silently dropped by the system
+until accessibility access is toggled off and back on — the check turns that into a clear
+message instead of a mystery no-op.
+
 ### The 预约抢票 button has no node at all
 
 Measured on `ProjectDetailActivity` (Android 13, 1220×2712), by dumping the tree with

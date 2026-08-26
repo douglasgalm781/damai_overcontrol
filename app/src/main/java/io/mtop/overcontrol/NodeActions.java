@@ -1,6 +1,7 @@
 package io.mtop.overcontrol;
 
 import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.accessibilityservice.GestureDescription;
 import android.graphics.Path;
 import android.graphics.Rect;
@@ -204,14 +205,59 @@ final class NodeActions {
 
     /** Synthesizes a short tap at screen coordinates. Requires canPerformGestures. */
     static boolean tapAt(AccessibilityService svc, float x, float y) {
-        Path path = new Path();
-        path.moveTo(x, y);
-        GestureDescription gesture = new GestureDescription.Builder()
-                .addStroke(new GestureDescription.StrokeDescription(path, 0L, TAP_DURATION_MS))
-                .build();
-        boolean dispatched = svc.dispatchGesture(gesture, null, null);
-        Log.i(TAG, "tapAt(" + x + ", " + y + ") dispatched=" + dispatched);
-        return dispatched;
+        // Android 9 and older reject a gesture whose coordinates fall outside the display
+        // with IllegalArgumentException rather than just refusing it, and they throw
+        // SecurityException when the service was enabled before its config declared
+        // canPerformGestures — which is what happens on an in-place upgrade, until
+        // accessibility access is toggled off and on again. Neither should take the app
+        // down, so both are caught and reported.
+        if (!hasGestureCapability(svc)) {
+            Log.w(TAG, "tapAt: service has no CAPABILITY_CAN_PERFORM_GESTURES — accessibility "
+                    + "access needs to be toggled off and back on after this app was updated");
+            return false;
+        }
+        if (x < 0 || y < 0 || Float.isNaN(x) || Float.isNaN(y)) {
+            Log.w(TAG, "tapAt: refusing off-screen coordinates (" + x + ", " + y + ")");
+            return false;
+        }
+        try {
+            Path path = new Path();
+            path.moveTo(x, y);
+            // Drag one pixel, rather than leaving a move-only path. Android 9 and older
+            // decide a stroke path is empty from its *bounds*, and a lone moveTo has
+            // bounds (x,y,x,y) — zero width and height, so RectF.isEmpty() is true and
+            // StrokeDescription throws IllegalArgumentException("Path is empty"). Newer
+            // releases test Path.isEmpty() instead, where the moveTo counts as a verb, so
+            // the very same path is accepted — which is why a move-only tap works on
+            // API 33 and blows up on API 28. One pixel still registers as a tap.
+            path.lineTo(x >= 1f ? x - 1f : x + 1f, y >= 1f ? y - 1f : y + 1f);
+            GestureDescription gesture = new GestureDescription.Builder()
+                    .addStroke(new GestureDescription.StrokeDescription(path, 0L, TAP_DURATION_MS))
+                    .build();
+            boolean dispatched = svc.dispatchGesture(gesture, null, null);
+            Log.i(TAG, "tapAt(" + x + ", " + y + ") dispatched=" + dispatched);
+            return dispatched;
+        } catch (IllegalArgumentException | SecurityException | IllegalStateException e) {
+            Log.w(TAG, "tapAt(" + x + ", " + y + ") failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the connected service may actually synthesize taps. Declaring
+     * canPerformGestures in the config isn't enough on its own: the capability is bound
+     * when the user enables the service, so a service that was already enabled under an
+     * older config keeps the old, gesture-less capability set until it is re-enabled.
+     */
+    static boolean hasGestureCapability(AccessibilityService svc) {
+        try {
+            AccessibilityServiceInfo info = svc.getServiceInfo();
+            return info != null && (info.getCapabilities()
+                    & AccessibilityServiceInfo.CAPABILITY_CAN_PERFORM_GESTURES) != 0;
+        } catch (Exception e) {
+            Log.w(TAG, "getServiceInfo failed", e);
+            return false;
+        }
     }
 
     /**

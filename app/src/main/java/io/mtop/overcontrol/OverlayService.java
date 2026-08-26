@@ -14,6 +14,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.ViewConfiguration;
@@ -107,10 +108,19 @@ public class OverlayService extends Service {
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
-            long now = System.currentTimeMillis();
-            maybeAutoClick(now);
-            render(now);
-            handler.postDelayed(this, 1000);
+            // Anything thrown here would otherwise kill the process — this runs on the
+            // main thread once a second — and take the countdown down with it. The click
+            // path reaches into another app's node tree, whose shape is not ours to
+            // predict, so it is treated as untrusted: log and keep ticking.
+            try {
+                long now = System.currentTimeMillis();
+                maybeAutoClick(now);
+                render(now);
+            } catch (Throwable t) {
+                Log.e(NodeActions.TAG, "tick failed", t);
+            } finally {
+                handler.postDelayed(this, 1000);
+            }
         }
     };
 
@@ -239,6 +249,13 @@ public class OverlayService extends Service {
         CountdownAccessibilityService svc = CountdownAccessibilityService.peek();
         if (svc == null) return; // accessibility access revoked; nothing to click through
         lastAutoAttemptAt = now;
+        if (!NodeActions.hasGestureCapability(svc)) {
+            if (!dumpedThisStreak) { // once per streak, same as the miss dump
+                dumpedThisStreak = true;
+                toast("请关闭再重新开启读屏权限 Turn accessibility access off and on again");
+            }
+            return;
+        }
         // Try the honest route first — it's the one that survives a Damai redesign, and
         // other pages (and older builds) do expose the button as a real node.
         boolean clicked = NodeActions.clickByText(svc, AUTO_CLICK_TARGET)
@@ -277,9 +294,22 @@ public class OverlayService extends Service {
             toast("读屏服务未连接 Accessibility service not connected");
             return;
         }
-        boolean clicked = NodeActions.clickByText(svc, CLICK_TARGETS)
-                || NodeActions.tapBesideAnchors(
-                        svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
+        if (!NodeActions.hasGestureCapability(svc)) {
+            // Almost always an in-place update: the capability set was bound when the
+            // service was first enabled, before the config asked for gestures.
+            toast("请关闭再重新开启读屏权限 Turn accessibility access off and on again");
+            return;
+        }
+        boolean clicked;
+        try {
+            clicked = NodeActions.clickByText(svc, CLICK_TARGETS)
+                    || NodeActions.tapBesideAnchors(
+                            svc, AUTO_CLICK_ANCHOR_ID_PREFIX, AUTO_CLICK_MIN_GAP_FRACTION);
+        } catch (Throwable t) {
+            Log.e(NodeActions.TAG, "manual click failed", t);
+            toast("点击出错 Click failed — see logcat");
+            return;
+        }
         toast(clicked
                 ? "已点击 Clicked"
                 : "未找到可点击目标 No target found on screen");
