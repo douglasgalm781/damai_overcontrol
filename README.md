@@ -120,6 +120,21 @@ under a config without `canPerformGestures`, taps are silently dropped by the sy
 until accessibility access is toggled off and back on — the check turns that into a clear
 message instead of a mystery no-op.
 
+### The reserved marker may never reach us — hence `ScreenLog`
+
+The bottom action button contributes **no node at all**, whether it reads 预约抢票 or
+已预约: a dump of the detail page shows only `帮助` and `想看` down there. So the reserved
+state cannot be read from the button, and `RESERVED_MARKERS` lists several spellings
+(`已预约`, `预约成功`, `取消预约`) in the hope that one of them is drawn somewhere that *is*
+exposed. Each is unambiguous alone — an unreserved page never says 取消预约 — and the bare
+`预约` badge on a tour-city tab deliberately matches none of them, which is what keeps an
+unreserved page from turning the pill green.
+
+When no marker is found, the scan records what the page *did* expose to `ScreenLog`, and
+`MainActivity` shows it under **诊断 · 最近未识别的页面**. That exists because the phone
+holding the reservation is rarely the one with adb attached: if the pill stays on
+"waiting" over a reserved show, that card is the evidence needed to pick the right marker.
+
 ### Match button labels, not substrings
 
 `clickByText` requires the node's text to *be* the label — equal to it, or containing it

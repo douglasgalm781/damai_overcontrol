@@ -15,14 +15,15 @@ import java.util.regex.Pattern;
 /**
  * Read-only accessibility service scoped to cn.damai (see
  * res/xml/accessibility_service_config.xml). On every window/content change in Damai it
- * walks the currently visible node tree looking for a concert marked {@value
- * #RESERVED_MARKER} — the one the user has already reserved. When it finds one it reads
+ * walks the currently visible node tree looking for a concert marked as reserved (see
+ * {@link #RESERVED_MARKERS}) — the one the user has already reserved. When it finds one it reads
  * that page's "开抢" on-sale time (see {@link CountdownParser}) plus the title, date, venue
  * and price, and hands them to {@link CountdownState} for {@link OverlayService} to
  * display and to click at T-0.
  *
- * <p>Pages with no {@value #RESERVED_MARKER} on them are ignored outright, however many
- * on-sale times they show.
+ * <p>Pages with no reserved marker on them are ignored outright, however many on-sale
+ * times they show; what they did expose is recorded to {@link ScreenLog} so a page that
+ * should have matched can be inspected in {@link MainActivity}.
  *
  * The scan itself never performs an action on a node (no click/focus/input) — only
  * getText()/getChild()/getParent(). Pressing things is a separate, explicitly-triggered
@@ -35,8 +36,14 @@ public class CountdownAccessibilityService extends AccessibilityService {
     /**
      * What Damai renders once a concert has been reserved, and so the marker for "this is
      * the concert the user cares about". Before reserving, the same control reads 预约抢票.
+     *
+     * <p>Several spellings, because the state surfaces differently depending on where it
+     * is drawn, and the one place we cannot read is the bottom action button — it puts no
+     * node in the tree at all (verified by dump: only 帮助 and 想看 are exposed down there).
+     * Each of these is unambiguous on its own: an unreserved page never says 取消预约, and
+     * the bare 预约 badge on a tour-city tab deliberately does not match any of them.
      */
-    private static final String RESERVED_MARKER = "已预约";
+    private static final String[] RESERVED_MARKERS = {"已预约", "预约成功", "取消预约"};
     private static final int MAX_NODES_PER_SCAN = 4000;
     private static final long MIN_SCAN_INTERVAL_MS = 800L;
 
@@ -160,7 +167,7 @@ public class CountdownAccessibilityService extends AccessibilityService {
             if (text != null) {
                 String trimmed = text.trim();
                 if (!trimmed.isEmpty()) texts.add(trimmed);
-                if (trimmed.contains(RESERVED_MARKER)) reservedHere = true;
+                if (!reservedHere && isReservedMarker(trimmed)) reservedHere = true;
                 if (trimmed.length() >= 6 && onSaleAt == null) {
                     onSaleAt = CountdownParser.parseFutureMillis(trimmed, now);
                 }
@@ -175,6 +182,11 @@ public class CountdownAccessibilityService extends AccessibilityService {
         }
 
         if (!reservedHere) {
+            // Record what this page *did* expose. If a concert is reserved and the pill
+            // still says "waiting", this is the evidence needed to find the right marker:
+            // the bottom action button contributes no node at all on the detail page, so
+            // 已预约 may simply never reach us. Shown in MainActivity.
+            ScreenLog.record(this, now, describeScreen(texts, onSaleAt));
             // Not the reserved concert's page. Leave whatever is already tracked alone —
             // it is still counting down — but nothing here can be clicked.
             CountdownState.setOnItsPage(false);
@@ -191,6 +203,26 @@ public class CountdownAccessibilityService extends AccessibilityService {
 
         CountdownState.observeReserved(onSaleAt, pickTitle(texts), pickDetails(texts), now);
         CountdownState.setOnItsPage(true);
+    }
+
+    /** A compact, human-readable snapshot of a screen for {@link ScreenLog}. */
+    private static String describeScreen(List<String> texts, Long onSaleAt) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("找不到标记 no reserved marker among: ")
+                .append(java.util.Arrays.toString(RESERVED_MARKERS)).append('\n');
+        sb.append("开抢时间 on-sale parsed: ").append(onSaleAt == null ? "no" : "yes").append('\n');
+        sb.append("页面文字 texts on screen (").append(texts.size()).append("):\n");
+        for (String t : texts) {
+            if (t.length() <= 30) sb.append("  · ").append(t).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static boolean isReservedMarker(String text) {
+        for (String marker : RESERVED_MARKERS) {
+            if (text.contains(marker)) return true;
+        }
+        return false;
     }
 
     /** A node's visible text, falling back to its content-description. */

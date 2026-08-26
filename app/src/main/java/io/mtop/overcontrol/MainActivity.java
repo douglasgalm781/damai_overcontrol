@@ -49,6 +49,8 @@ public class MainActivity extends Activity {
     private TextView pillToggle;
     private LinearLayout crashCard;
     private TextView crashText;
+    private LinearLayout screenCard;
+    private TextView screenText;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -68,6 +70,7 @@ public class MainActivity extends Activity {
         page.addView(permissionsCard());
         page.addView(howItWorksCard());
         page.addView(shutdownCard());
+        page.addView(screenCard());
         page.addView(crashCard());
 
         ScrollView scroller = new ScrollView(this);
@@ -213,6 +216,41 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * What the last unrecognised Damai page exposed. Only useful when the pill is stuck on
+     * "waiting" — it answers whether the reserved marker reaches accessibility at all.
+     */
+    private View screenCard() {
+        screenCard = card();
+        screenCard.addView(cardTitle("诊断 · 最近未识别的页面 Last unrecognised page"));
+
+        TextView note = new TextView(this);
+        note.setText("悬浮窗一直显示“等待已预约演出”时，打开已预约的演出页面，再回到这里查看下面的文字。\n"
+                + "If the pill stays on \"waiting\", open the reserved show's page, then come "
+                + "back here and read what it exposed.");
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        note.setTextColor(INK_SOFT);
+        note.setPadding(0, 0, 0, dp(10));
+        screenCard.addView(note);
+
+        screenText = new TextView(this);
+        screenText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        screenText.setTypeface(Typeface.MONOSPACE);
+        screenText.setTextColor(INK);
+        screenText.setTextIsSelectable(true);
+        screenText.setPadding(dp(10), dp(10), dp(10), dp(10));
+        screenText.setBackground(rounded(0xFFF3F6F6, dp(8)));
+        screenCard.addView(screenText);
+
+        View clear = button("清除 Clear", false, v -> {
+            ScreenLog.clear(this);
+            refresh();
+        });
+        ((LinearLayout.LayoutParams) clear.getLayoutParams()).topMargin = dp(12);
+        screenCard.addView(clear);
+        return screenCard;
+    }
+
     private View crashCard() {
         crashCard = card();
         crashCard.addView(cardTitle("⚠ 上次崩溃 Last crash"));
@@ -265,6 +303,14 @@ public class MainActivity extends Activity {
         setChip(pillState, pillUp);
         pillState.setText(pillUp ? "显示中 ON" : "已隐藏 OFF");
         pillToggle.setText(pillUp ? "隐藏悬浮窗 Hide pill" : "显示悬浮窗 Show pill");
+
+        String screen = ScreenLog.read(this);
+        if (screen == null) {
+            screenCard.setVisibility(View.GONE);
+        } else {
+            screenCard.setVisibility(View.VISIBLE);
+            screenText.setText(screen);
+        }
 
         String crash = CrashLog.read(this);
         if (crash == null) {
