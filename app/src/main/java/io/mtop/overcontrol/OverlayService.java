@@ -13,7 +13,14 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.graphics.Typeface;
 import android.provider.Settings;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.StyleSpan;
+import android.text.style.TypefaceSpan;
 import android.util.Log;
 import android.view.Gravity;
 import android.util.DisplayMetrics;
@@ -143,8 +150,10 @@ public class OverlayService extends Service {
     // reservation (or a rescheduled one) starts over with a clean slate.
     private long bookedTarget = 0L;      // on-sale time we have already pressed for
     private long lastBookAttemptAt = 0L;
-    private boolean dumpedThisTarget = false;
+    private long dumpedForTarget = Long.MIN_VALUE; // which target already logged a miss
     private int collapsedY = -1; // where the pill sat before the panel opened
+    private String lastDetail;   // so the panel only re-lays out when its text changes
+    private Boolean armedShown;
     private int lastLaidOutHeight = -1;
     private int lastLaidOutWidth = -1;
 
@@ -279,7 +288,10 @@ public class OverlayService extends Service {
                 case MotionEvent.ACTION_MOVE:
                     lp.x = (int) (drag[2] + (ev.getRawX() - drag[0]));
                     lp.y = (int) (drag[3] + (ev.getRawY() - drag[1]));
-                    if (movedBeyondSlop(ev)) handler.removeCallbacks(longPress); // it's a drag
+                    if (movedBeyondSlop(ev)) {
+                        handler.removeCallbacks(longPress); // it's a drag
+                        collapsedY = -1; // moved on purpose; don't snap back on collapse
+                    }
                     clampToScreen();
                     applyLayout();
                     return true;
@@ -405,7 +417,6 @@ public class OverlayService extends Service {
         if (show == null) return;
         if (!armed) return; // paused from the panel — no press while stopped
 
-        if (show.target != bookedTarget) dumpedThisTarget = false; // new concert, new slate
         if (now < show.target) return;                             // not yet
         if (bookedTarget == show.target) return;                   // already pressed
         // Measured from the later of T-0 and the moment this was armed, so pausing over the
@@ -420,8 +431,8 @@ public class OverlayService extends Service {
         if (svc == null) return; // accessibility access revoked; nothing to click through
         lastBookAttemptAt = now;
         if (!NodeActions.hasGestureCapability(svc)) {
-            if (!dumpedThisTarget) {
-                dumpedThisTarget = true;
+            if (dumpedForTarget != show.target) {
+                dumpedForTarget = show.target;
                 toast("请关闭再重新开启读屏权限 Turn accessibility access off and on again");
             }
             return;
@@ -438,8 +449,10 @@ public class OverlayService extends Service {
                 bookedTarget = target;
                 showClickEffect();
                 toast("已点击 " + BOOK_NOW_TARGET);
-            } else if (DUMP_ON_MISS && !dumpedThisTarget) {
-                dumpedThisTarget = true;
+            } else if (DUMP_ON_MISS && dumpedForTarget != target) {
+                // Keyed on the target, not a flag reset each tick — otherwise every one of
+                // the ~80 retries in the booking window dumps the whole node tree.
+                dumpedForTarget = target;
                 NodeActions.dumpScreen(svc);
             }
         });
@@ -513,6 +526,18 @@ public class OverlayService extends Service {
     /** Width of the panel's controls; keeps the overlay as narrow as the pill's text. */
     private static final int CONTROL_WIDTH_DP = 236;
 
+    // The countdown is the reason this overlay exists, so it is set well above everything
+    // else on the pill and the label is demoted to a caption above it.
+    private static final float TIME_SCALE = 1.75f;
+    private static final float LABEL_SCALE = 0.78f;
+    private static final int LABEL_INK = 0xFFB9CCC9;
+    private static final int TIME_INK = 0xFFFFFFFF;
+    /** Inside the last minute, and then the last ten seconds, the clock changes colour. */
+    private static final int TIME_INK_SOON = 0xFFFFC46B;
+    private static final int TIME_INK_NOW = 0xFFFF7A5C;
+    private static final long SOON_MS = 60_000L;
+    private static final long IMMINENT_MS = 10_000L;
+
     private void render() {
         render(System.currentTimeMillis());
     }
@@ -521,27 +546,63 @@ public class OverlayService extends Service {
         if (pill == null) return;
         CountdownState.Show show = CountdownState.reserved(now);
 
-        String text;
         if (show == null) {
-            text = "⚪ 等待演出信息\nWaiting for a show";
+            pill.setText(caption("⚪ 等待演出信息\nWaiting for a show"));
         } else {
             // 🟢 only once Damai has shown this concert as reserved; an unreserved one
             // still counts down, it just isn't green yet.
             String dot = show.reserved ? "🟢" : "⚪";
             long remaining = show.target - now;
             if (remaining > 0) {
-                text = dot + (armed ? "" : " ⏸") + " 开票倒计时 Starts in\n" + fmt(remaining);
+                pill.setText(headline(
+                        dot + (armed ? "" : " ⏸") + " 开票倒计时 Starts in",
+                        fmt(remaining),
+                        timeInk(remaining)));
             } else {
                 // Past the on-sale time there is no countdown left to show — only what
-                // the booking press is doing.
-                text = dot + " " + onSaleLine(now, show);
+                // the booking press is doing, and that becomes the headline instead.
+                pill.setText(headline(dot + " 开票时间已到 On sale", onSaleLine(now, show), TIME_INK));
             }
         }
-        pill.setText(text);
 
         renderPanel(show);
     }
 
+
+    /**
+     * A small caption above a large value — the countdown set as the thing you actually
+     * read from across the room, with its label demoted to a line of context.
+     *
+     * <p>The value is monospaced so the digits keep a constant width: proportional digits
+     * make the pill breathe in and out once a second, which relayouts the window and is
+     * visibly restless.
+     */
+    private CharSequence headline(String label, String value, int valueInk) {
+        SpannableStringBuilder sb = new SpannableStringBuilder(label).append('\n').append(value);
+        int split = label.length() + 1;
+        sb.setSpan(new RelativeSizeSpan(LABEL_SCALE), 0, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new ForegroundColorSpan(LABEL_INK), 0, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new RelativeSizeSpan(TIME_SCALE), split, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new StyleSpan(Typeface.BOLD), split, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new TypefaceSpan("monospace"), split, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new ForegroundColorSpan(valueInk), split, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return sb;
+    }
+
+    /** The waiting state has no value to feature, so it is all caption. */
+    private CharSequence caption(String text) {
+        SpannableStringBuilder sb = new SpannableStringBuilder(text);
+        sb.setSpan(new RelativeSizeSpan(LABEL_SCALE), 0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        sb.setSpan(new ForegroundColorSpan(LABEL_INK), 0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return sb;
+    }
+
+    /** Warms the clock as it runs out, so the last minute is unmistakable. */
+    private static int timeInk(long remaining) {
+        if (remaining <= IMMINENT_MS) return TIME_INK_NOW;
+        if (remaining <= SOON_MS) return TIME_INK_SOON;
+        return TIME_INK;
+    }
 
     /** The tap-open panel: what this concert is, and the control over the T-0 press. */
     private void renderPanel(CountdownState.Show show) {
@@ -549,9 +610,18 @@ public class OverlayService extends Service {
         panel.setVisibility(expanded ? View.VISIBLE : View.GONE);
         if (!expanded) return;
 
-        detailText.setText(show == null ? "尚未识别演出 No show identified yet" : describe(show));
-        armButton.setText(armed ? "⏸  暂停自动抢票 Pause" : "▶  开始自动抢票 Start");
-        armButton.setBackground(pillShape(armed ? 0x33FFFFFF : 0xFF0B6B6B));
+        // Only on change: setText and setBackground each force a layout pass, and this
+        // runs once a second behind a countdown that has nothing to do with the panel.
+        String detail = show == null ? "尚未识别演出 No show identified yet" : describe(show);
+        if (!detail.equals(lastDetail)) {
+            lastDetail = detail;
+            detailText.setText(detail);
+        }
+        if (armedShown == null || armedShown != armed) {
+            armedShown = armed;
+            armButton.setText(armed ? "⏸  暂停自动抢票 Pause" : "▶  开始自动抢票 Start");
+            armButton.setBackground(pillShape(armed ? 0x33FFFFFF : 0xFF0B6B6B));
+        }
     }
 
     /** What the pill says from T-0 onward: pressing, pressed, or the window has closed. */

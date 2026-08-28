@@ -179,10 +179,14 @@ public class CountdownAccessibilityService extends AccessibilityService {
             node.recycle();
         }
 
-        if (!reservedHere) {
+        if (!reservedHere && onSaleAt != null) {
             // Record what this page exposed, so a reserved concert that never turns the
             // pill green can be diagnosed in MainActivity: the bottom action button puts
             // no node in the tree at all, so 已预约 may simply never reach us.
+            //
+            // Only for pages that look like a concert (they carry an on-sale time). Every
+            // Damai screen would otherwise rewrite the file every few seconds, burning IO
+            // and burying the one page worth looking at under the home feed.
             ScreenLog.record(this, now, describeScreen(texts, onSaleAt));
         }
 

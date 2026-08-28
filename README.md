@@ -247,6 +247,13 @@ window to fit would leave a rectangle of invisible padding swallowing taps meant
 underneath. That window is `FLAG_NOT_TOUCHABLE` and removes itself when the animation
 ends.
 
+The countdown is set as the pill's headline: a small muted caption (`开票倒计时 Starts in`)
+above the remaining time at `TIME_SCALE` (1.75×), bold and **monospaced** — proportional
+digits make the pill breathe in and out once a second, relayouting the window each tick.
+The clock warms as it runs out: white, then amber inside the last minute, then red inside
+the last ten seconds. Past T-0 the booking status takes the headline's place, since there
+is no time left to show.
+
 The pill shows `⚪` while waiting for a reserved show and `🟢` once it is tracking one,
 then `🎯 抢票中…` → `✅ 已抢` through the booking. Expanded, it lists the concert's title,
 date, venue and price.
